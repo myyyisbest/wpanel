@@ -104,14 +104,15 @@ export default function Dashboard() {
   },[]);
 
   const loadActivity = useCallback(async () => {
+    if (!token) return;
     try {
-      const response = await fetch(`${API}/api/activity?page=1&pageSize=4`,{cache:'no-store'});
+      const response = await fetch(`${API}/api/activity?page=1&pageSize=4`,{headers:{'X-WPanel-Token':token},cache:'no-store'});
       if (response.ok) {
         const result = await response.json() as {items?:ActivityEntry[]};
         setActivity(result.items || []);
       }
     } catch {}
-  },[]);
+  },[token]);
 
   useEffect(() => {
     // 启动时同步 localStorage 里保存的主题偏好（外部系统读取）
