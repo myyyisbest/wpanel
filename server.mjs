@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, realpath, access, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync, readdirSync, createReadStream, createWriteStream } from 'node:fs';
 import { Transform } from 'node:stream';
@@ -132,6 +132,7 @@ async function run(file, args, options = {}) {
       windowsHide: true,
       timeout: options.timeout ?? 20_000,
       maxBuffer: options.maxBuffer ?? 8 * 1024 * 1024,
+      cwd: options.cwd,
     });
     return { ok: true, stdout: decodeOutput(result.stdout), stderr: decodeOutput(result.stderr), code: 0 };
   } catch (error) {
@@ -371,23 +372,38 @@ function validProjectName(name) {
 
 // ===== 应用商店（默认 1Panel appstore 仓库，tarball 下载到本地缓存；仅取 compose 与变量定义，忽略任何脚本字段） =====
 const STORE_DIR = path.join(DATA_DIR, 'store-cache', 'appstore');
-const STORE_REPO = process.env.WPANEL_STORE_REPO || 'https://github.com/1Panel-dev/appstore';
-const STORE_BRANCH = process.env.WPANEL_STORE_BRANCH || 'main';
+const STORE_REPO_DEFAULT = process.env.WPANEL_STORE_REPO || 'https://github.com/1Panel-dev/appstore';
+const STORE_BRANCH_DEFAULT = process.env.WPANEL_STORE_BRANCH || 'main';
+// 模板源可在界面修改，持久化在 data/wpanel.local.json 的 store 段（不进 git）
+function readStoreConfig() {
+  const fallback = { repo: STORE_REPO_DEFAULT, branch: STORE_BRANCH_DEFAULT };
+  try {
+    const parsed = JSON.parse(readFileSync(LOCAL_CONFIG_FILE, 'utf8'));
+    const repo = parsed?.store?.repo;
+    const branch = parsed?.store?.branch;
+    return {
+      repo: typeof repo === 'string' && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?$/.test(repo) ? repo.replace(/\.git$/, '') : fallback.repo,
+      branch: typeof branch === 'string' && /^[\w.-]{1,64}$/.test(branch) ? branch : fallback.branch,
+    };
+  } catch { return fallback; }
+}
 const validAppId = (id) => typeof id === 'string' && /^[a-z0-9][a-z0-9._-]{0,127}$/.test(id);
 
 async function downloadStore() {
+  const { repo, branch } = readStoreConfig();
   const cacheDir = path.dirname(STORE_DIR);
   await mkdir(cacheDir, { recursive: true });
   // 走 codeload tarball（git 协议在部分网络环境不可达）
-  const codeload = `${STORE_REPO.replace(/\/$/, '').replace('https://github.com/', 'https://codeload.github.com/')}/tar.gz/refs/heads/${STORE_BRANCH}`;
+  const codeload = `${repo.replace(/\/$/, '').replace('https://github.com/', 'https://codeload.github.com/')}/tar.gz/refs/heads/${branch}`;
   const response = await fetch(codeload, { redirect: 'follow', signal: AbortSignal.timeout(600_000) });
   if (!response.ok || !response.body) throw new Error(`模板源下载失败（HTTP ${response.status}）`);
   const tarPath = path.join(cacheDir, 'store.tar.gz');
   await pipeline(response.body, createWriteStream(tarPath));
-  const extractResult = await run('tar', ['-xzf', tarPath, '-C', cacheDir], { timeout: 300_000 });
+  // 用相对路径解压：GNU tar 会把 'C:\' 中的冒号当作远程主机名
+  const extractResult = await run('tar', ['-xzf', 'store.tar.gz'], { timeout: 300_000, cwd: cacheDir });
   await rm(tarPath, { force: true });
   if (!extractResult.ok) throw new Error('模板源解压失败：' + (extractResult.stderr || '').slice(0, 200));
-  const extracted = path.join(cacheDir, `${(STORE_REPO.split('/').pop() || 'appstore').replace(/\.git$/, '')}-${STORE_BRANCH}`);
+  const extracted = path.join(cacheDir, `${(repo.split('/').pop() || 'appstore').replace(/\.git$/, '')}-${branch}`);
   if (!existsSync(path.join(extracted, 'apps'))) throw new Error('模板源解压后缺少 apps 目录');
   if (existsSync(STORE_DIR)) await rm(STORE_DIR, { recursive: true, force: true });
   await rename(extracted, STORE_DIR);
@@ -396,6 +412,13 @@ async function downloadStore() {
 async function ensureStore() {
   if (existsSync(path.join(STORE_DIR, 'apps'))) return;
   await downloadStore();
+}
+
+// 安装后台任务：compose up 拉镜像可能持续数分钟，输出流式存入内存任务供前端轮询
+const installJobs = new Map();
+function pruneInstallJobs() {
+  if (installJobs.size <= 20) return;
+  for (const key of [...installJobs.keys()].slice(0, installJobs.size - 20)) installJobs.delete(key);
 }
 
 function safeStorePath(...segments) {
@@ -591,16 +614,35 @@ async function handleAction(pathname, body) {
         }
         envLines.push(`${key}=${value}`);
       }
+      const upArgs = 'up -d';
       const composeText = readFileSync(safeStorePath('apps', id, version, 'docker-compose.yml'), 'utf8');
       await mkdir(composeUnc, { recursive: true });
       await writeFile(`${composeUnc}\\docker-compose.yml`, composeText, 'utf8');
       await writeFile(`${composeUnc}\\.env`, envLines.join('\n') + '\n', 'utf8');
-      if (/^\s*\d+\.\s*external:\s*true/m.test(composeText) || composeText.includes('1panel-network')) {
+      if (composeText.includes('1panel-network')) {
         const network = await docker('network', 'inspect', '1panel-network');
         if (!network.ok) await docker('network', 'create', '1panel-network');
       }
-      const upResult = await runCompose(id, 'up -d', 300_000);
-      return addActivity('install', `store ${id}`, true, `v${version} 部署完成 ${upResult.stdout.slice(-150)}`);
+      // 后台任务执行 up（镜像拉取可能持续数分钟），前端轮询 /api/store/job/<id> 展示实时输出
+      const jobId = randomUUID().replaceAll('-', '');
+      const job = { status: 'running', output: '' };
+      installJobs.set(jobId, job);
+      pruneInstallJobs();
+      const dir = await resolveComposeDir();
+      const child = spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'bash', '-lc', `cd '${dir}/${id}' && docker compose ${upArgs} 2>&1`], { windowsHide: true });
+      const append = (chunk) => {
+        job.output += chunk.toString('utf8');
+        if (job.output.length > 120000) job.output = job.output.slice(-90000);
+      };
+      child.stdout.on('data', append);
+      child.stderr.on('data', append);
+      child.on('error', (error) => { job.status = 'error'; job.output += `\n${error.message}`; });
+      child.on('close', (code) => {
+        job.status = code === 0 ? 'done' : 'error';
+        job.output += `\n[进程退出码 ${code}]`;
+        addActivity('install', `store ${id}`, code === 0, `v${version} ${code === 0 ? '部署完成' : '部署失败（见安装日志）'}`).catch(() => {});
+      });
+      return { __raw: { ok: true, jobId } };
     }
 
     // uninstall
@@ -778,7 +820,33 @@ const server = http.createServer(async (request, response) => {
         .map((item) => { try { return storeAppMeta(item.name); } catch { return null; } })
         .filter(Boolean)
         .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
-      return send(response, 200, { source: STORE_REPO, apps }, origin);
+      const storeConfig = readStoreConfig();
+      return send(response, 200, { source: `${storeConfig.repo}@${storeConfig.branch}`, apps }, origin);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/store/source') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const body = await readBody(request);
+      const repo = SAFE_TEXT(body.repo, 300).replace(/\/$/, '').replace(/\.git$/, '');
+      const branch = SAFE_TEXT(body.branch, 64) || 'main';
+      if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error('模板源需为 GitHub 仓库地址（https://github.com/用户/仓库）');
+      if (!/^[\w.-]{1,64}$/.test(branch)) throw new Error('分支名无效');
+      await mkdir(DATA_DIR, { recursive: true });
+      let local = {};
+      try { local = JSON.parse(readFileSync(LOCAL_CONFIG_FILE, 'utf8')); } catch { local = {}; }
+      local.store = { repo, branch };
+      await writeFile(LOCAL_CONFIG_FILE, JSON.stringify(local, null, 2), 'utf8');
+      await rm(STORE_DIR, { recursive: true, force: true });
+      return addActivity('save', '商店模板源', true, `${repo}@${branch}（下次打开商店时重新下载）`);
+    }
+
+    if (request.method === 'GET' && url.pathname.startsWith('/api/store/job/')) {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const jobId = url.pathname.slice('/api/store/job/'.length);
+      if (!/^[a-f0-9]{32}$/.test(jobId)) throw new Error('任务 ID 无效');
+      const job = installJobs.get(jobId);
+      if (!job) return send(response, 404, { error: '任务不存在或已被清理' }, origin);
+      return send(response, 200, { status: job.status, output: job.output.slice(-20000) }, origin);
     }
 
     if (request.method === 'GET' && url.pathname.startsWith('/api/store/logo/')) {
@@ -820,7 +888,8 @@ const server = http.createServer(async (request, response) => {
       if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
       await rm(STORE_DIR, { recursive: true, force: true });
       await downloadStore();
-      return addActivity('refresh', '应用商店', true, `模板源已更新（${STORE_REPO}@${STORE_BRANCH}）`);
+      const storeConfig = readStoreConfig();
+      return addActivity('refresh', '应用商店', true, `模板源已更新（${storeConfig.repo}@${storeConfig.branch}）`);
     }
 
     // 实时日志（SSE）：docker logs -f，token 走查询参数（EventSource 无法携带请求头）

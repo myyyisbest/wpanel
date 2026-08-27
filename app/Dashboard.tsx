@@ -275,7 +275,7 @@ export default function Dashboard() {
 
         <div className="view-fade" hidden={view!=='compose'}><ComposePage token={token} notify={notify} containers={status?.containers.map(item=>({name:item.name,project:item.project,running:item.running}))||[]}/></div>
 
-        <div className="view-fade" hidden={view!=='store'}><StorePage token={token} notify={notify}/></div>
+        <div className="view-fade" hidden={view!=='store'}><StorePage token={token} notify={notify} onNavigate={(target)=>setView(target as typeof view)}/></div>
 
         <div className="view-fade" hidden={view!=='ai'}><AiPage token={token} notify={notify} containers={status?.containers.map(item=>({name:item.name,running:item.running}))||[]} onChanged={()=>{refresh();loadActivity();}}/></div>
 
