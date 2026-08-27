@@ -60,6 +60,8 @@ export default function StorePage({ token, notify, onNavigate }:{ token:string;n
     return () => window.clearInterval(timer);
   },[job,token]);
 
+  // 依赖 job.output 触发自动滚底（轮询 effect 单独管理任务刷新）
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在输出变化时滚动
   useEffect(() => { if (job && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; },[job?.output]);
 
   // 参数变化后防抖渲染最终 compose（与安装共用服务端渲染逻辑，所见即所装）

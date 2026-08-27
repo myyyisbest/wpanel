@@ -274,13 +274,20 @@ async function addActivity(action, target, success, message) {
   return entry;
 }
 
-async function readActivity(limit = 50) {
+// 审计日志读取：服务端关键字过滤 + 分页（最多回溯 5000 条，防止文件过大拖垮内存）
+async function readActivity({ search = '', page = 1, pageSize = 30 } = {}) {
+  let entries = [];
   try {
-    const lines = (await readFile(ACTIVITY_FILE, 'utf8')).split('\n').filter(Boolean).slice(-limit);
-    return lines.map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean).reverse();
-  } catch {
-    return [];
-  }
+    const lines = (await readFile(ACTIVITY_FILE, 'utf8')).split('\n').filter(Boolean).slice(-5000);
+    entries = lines.map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean).reverse();
+  } catch { entries = []; }
+  const keyword = String(search || '').trim().toLowerCase();
+  const filtered = keyword
+    ? entries.filter((item) => `${item.action} ${item.target} ${item.message}`.toLowerCase().includes(keyword))
+    : entries;
+  const total = filtered.length;
+  const start = (Math.max(1, page) - 1) * pageSize;
+  return { total, page: Math.max(1, page), pageSize, items: filtered.slice(start, start + pageSize) };
 }
 
 async function readBody(request, maxBytes = 64 * 1024) {
@@ -986,7 +993,13 @@ const server = http.createServer(async (request, response) => {
       }
     }
 
-    if (request.method === 'GET' && url.pathname === '/api/activity') return send(response, 200, await readActivity(), origin);
+    if (request.method === 'GET' && url.pathname === '/api/activity') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const page = Math.max(1, Number(url.searchParams.get('page')) || 1);
+      const pageSizeRaw = Number(url.searchParams.get('pageSize')) || 30;
+      const pageSize = Math.min(100, Math.max(1, pageSizeRaw));
+      return send(response, 200, await readActivity({ search: url.searchParams.get('search') || '', page, pageSize }), origin);
+    }
 
     // ===== 应用商店 =====
     if (request.method === 'GET' && url.pathname === '/api/store/apps') {

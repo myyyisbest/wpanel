@@ -54,6 +54,8 @@ export default function ImagesVolumes({ token, notify }:{ token:string;notify:(t
     return () => window.clearInterval(timer);
   },[job,token,load]);
 
+  // 依赖 job.output 触发自动滚底（轮询 effect 单独管理任务刷新）
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在输出变化时滚动
   useEffect(() => { if (job && jobLogRef.current) jobLogRef.current.scrollTop = jobLogRef.current.scrollHeight; },[job?.output]);
 
   function pullImage() {

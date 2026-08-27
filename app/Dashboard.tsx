@@ -6,6 +6,7 @@ import ImagesVolumes from './ImagesVolumes';
 import ComposePage from './ComposePage';
 import StorePage from './StorePage';
 import AiPage from './AiPage';
+import ActivityLog, { activityIcon } from './ActivityLog';
 
 type ContainerInfo = { id:string; name:string; image:string; state:string; status:string; ports:string; project:string; running:boolean };
 type DockerDfItem = { Type:string; Total:number; Size:string };
@@ -29,7 +30,6 @@ function hostPorts(ports:string) {
   for (const match of ports.matchAll(/:(\d+)->/g)) found.add(match[1]);
   return [...found];
 }
-const activityIcon:{[action:string]:string} = { start:'▶', stop:'■', shutdown:'■', restart:'↻', error:'!', save:'✎', upload:'↑', download:'↓', mkdir:'+', touch:'+', rename:'→', delete:'×', prune:'✂', exec:'›', install:'⤓', refresh:'⟳' };
 const themeName:{[mode in ThemeMode]:string} = { auto:'跟随系统', light:'浅色', dark:'深色' };
 
 function Icon({ name, size=16 }:{ name:string; size?:number }) {
@@ -105,8 +105,11 @@ export default function Dashboard() {
 
   const loadActivity = useCallback(async () => {
     try {
-      const response = await fetch(`${API}/api/activity`,{cache:'no-store'});
-      if (response.ok) setActivity(await response.json());
+      const response = await fetch(`${API}/api/activity?page=1&pageSize=4`,{cache:'no-store'});
+      if (response.ok) {
+        const result = await response.json() as {items?:ActivityEntry[]};
+        setActivity(result.items || []);
+      }
     } catch {}
   },[]);
 
@@ -290,7 +293,7 @@ export default function Dashboard() {
         <button className={view==='store'?'nav-item active':'nav-item'} onClick={()=>setView('store')}><span><Icon name="store"/></span>应用商店</button>
         <button className={view==='ai'?'nav-item active':'nav-item'} onClick={()=>setView('ai')}><span><Icon name="spark"/></span>AI 助手</button>
         <button className={view==='files'?'nav-item active':'nav-item'} onClick={()=>setView('files')}><span><Icon name="folder"/></span>文件管理</button>
-        <button className={view==='activity'?'nav-item active':'nav-item'} onClick={()=>setView('activity')}><span><Icon name="activity"/></span>运行信息</button>
+        <button className={view==='activity'?'nav-item active':'nav-item'} onClick={()=>setView('activity')}><span><Icon name="activity"/></span>日志记录</button>
       </nav>
       <div className="sidebar-foot"><div className="host-mini"><span className={ubuntuOn?'pulse-dot':'offline-dot'}/><div><strong>{status?.host||'本机'}</strong><small>Ubuntu · WSL2</small></div></div><div className="security-note">仅限本机访问<br/>不开放远程终端</div></div>
     </aside>
@@ -380,11 +383,7 @@ export default function Dashboard() {
           </table></div>}
         </section></div>
 
-        <div className="view-fade" hidden={view!=='activity'}><section className="activity-panel"><div className="section-title"><div><h2>运行信息</h2><p>最近 50 条操作记录与控制边界</p></div>{busy&&<span className="working">{busy}…</span>}</div>
-          {activity.length===0&&<div className="activity-empty">暂无操作记录，启动、停止或重启后这里会显示历史。</div>}
-          {activity.map((entry,index)=><div className="activity-row" key={`${entry.at}-${index}`}><span className={`activity-icon ${entry.success?'success':'fail'}`}>{activityIcon[entry.action]||'·'}</span><div><strong>{entry.target}</strong><p>{entry.message}</p></div><time>{new Date(entry.at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}</time></div>)}
-          <div className="activity-row"><span className="activity-icon">⌾</span><div><strong>本机安全模式</strong><p>无删除、清理和任意命令接口；仅允许可信本机页面访问</p></div><time>已启用</time></div>
-        </section></div>
+        <div className="view-fade" hidden={view!=='activity'}><ActivityLog token={token} visible={view==='activity'}/></div>
       </div>
     </section>
 
