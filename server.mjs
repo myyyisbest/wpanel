@@ -1,12 +1,12 @@
 import http from 'node:http';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomBytes } from 'node:crypto';
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, realpath, access, writeFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
-import { createReadStream, createWriteStream } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, createReadStream, createWriteStream } from 'node:fs';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { parse as parseYaml } from 'yaml';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -321,6 +321,133 @@ function serviceUnitFor(key) {
   return readServicesConfig().find((item) => item.key === key)?.unit || null;
 }
 
+// ===== AI 副驾驶：只读建议者。配置存 data/ai.local.json（不进 git），AI 输出一律不直接执行 =====
+const AI_CONFIG_FILE = path.join(DATA_DIR, 'ai.local.json');
+function readAiConfig() {
+  try {
+    const config = JSON.parse(readFileSync(AI_CONFIG_FILE, 'utf8'));
+    if (!config.baseUrl || !config.apiKey || !config.model) return null;
+    return { baseUrl: String(config.baseUrl).replace(/\/$/, ''), apiKey: String(config.apiKey), model: String(config.model) };
+  } catch { return null; }
+}
+
+async function aiChat(messages) {
+  const config = readAiConfig();
+  if (!config) throw new Error('尚未配置 AI：请在「AI 助手」页填写 OpenAI 兼容接口地址、密钥与模型');
+  let response;
+  try {
+    response = await fetch(`${config.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` },
+      body: JSON.stringify({ model: config.model, messages, temperature: 0.2 }),
+      signal: AbortSignal.timeout(120_000),
+    });
+  } catch (error) {
+    throw new Error(`无法连接 AI 接口（${config.baseUrl}）：${error.message === 'fetch failed' ? '网络不可达或地址有误' : error.message}`);
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`AI 接口错误（HTTP ${response.status}）：${(data.error?.message || '').slice(0, 200)}`);
+  const content = data.choices?.[0]?.message?.content;
+  if (typeof content !== 'string') throw new Error('AI 返回内容为空');
+  return content;
+}
+
+const SAFE_TEXT = (value, max = 8000) => String(value || '').slice(0, max);
+
+const COMPOSE_FILE_NAMES = ['compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml'];
+let composeDirCache = null;
+async function resolveComposeDir() {
+  // 默认放在 WSL 默认用户的 home 下（UNC 共享以该身份访问，必须可写），可用 WPANEL_COMPOSE_DIR 覆盖
+  if (process.env.WPANEL_COMPOSE_DIR) return process.env.WPANEL_COMPOSE_DIR.replaceAll('\\', '/');
+  if (composeDirCache) return composeDirCache;
+  const home = await run('wsl.exe', ['-d', DISTRO, '--exec', 'sh', '-c', 'printf %s "$HOME"']);
+  composeDirCache = `${home.ok && home.stdout ? home.stdout.trim() : FILE_ROOTS[0] || '/tmp'}/compose`;
+  return composeDirCache;
+}
+
+function validProjectName(name) {
+  return typeof name === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name) && !name.includes('..');
+}
+
+// ===== 应用商店（默认 1Panel appstore 仓库，tarball 下载到本地缓存；仅取 compose 与变量定义，忽略任何脚本字段） =====
+const STORE_DIR = path.join(DATA_DIR, 'store-cache', 'appstore');
+const STORE_REPO = process.env.WPANEL_STORE_REPO || 'https://github.com/1Panel-dev/appstore';
+const STORE_BRANCH = process.env.WPANEL_STORE_BRANCH || 'main';
+const validAppId = (id) => typeof id === 'string' && /^[a-z0-9][a-z0-9._-]{0,127}$/.test(id);
+
+async function downloadStore() {
+  const cacheDir = path.dirname(STORE_DIR);
+  await mkdir(cacheDir, { recursive: true });
+  // 走 codeload tarball（git 协议在部分网络环境不可达）
+  const codeload = `${STORE_REPO.replace(/\/$/, '').replace('https://github.com/', 'https://codeload.github.com/')}/tar.gz/refs/heads/${STORE_BRANCH}`;
+  const response = await fetch(codeload, { redirect: 'follow', signal: AbortSignal.timeout(600_000) });
+  if (!response.ok || !response.body) throw new Error(`模板源下载失败（HTTP ${response.status}）`);
+  const tarPath = path.join(cacheDir, 'store.tar.gz');
+  await pipeline(response.body, createWriteStream(tarPath));
+  const extractResult = await run('tar', ['-xzf', tarPath, '-C', cacheDir], { timeout: 300_000 });
+  await rm(tarPath, { force: true });
+  if (!extractResult.ok) throw new Error('模板源解压失败：' + (extractResult.stderr || '').slice(0, 200));
+  const extracted = path.join(cacheDir, `${(STORE_REPO.split('/').pop() || 'appstore').replace(/\.git$/, '')}-${STORE_BRANCH}`);
+  if (!existsSync(path.join(extracted, 'apps'))) throw new Error('模板源解压后缺少 apps 目录');
+  if (existsSync(STORE_DIR)) await rm(STORE_DIR, { recursive: true, force: true });
+  await rename(extracted, STORE_DIR);
+}
+
+async function ensureStore() {
+  if (existsSync(path.join(STORE_DIR, 'apps'))) return;
+  await downloadStore();
+}
+
+function safeStorePath(...segments) {
+  const resolved = path.resolve(STORE_DIR, ...segments);
+  if (!resolved.startsWith(path.resolve(STORE_DIR))) throw new Error('路径无效');
+  return resolved;
+}
+
+function storeAppMeta(id) {
+  const file = safeStorePath('apps', id, 'data.yml');
+  const meta = parseYaml(readFileSync(file, 'utf8')) || {};
+  const props = meta.additionalProperties || {};
+  return {
+    id,
+    name: props.name || meta.name || id,
+    title: props.shortDescZh || meta.description || props.shortDescEn || '',
+    description: meta.description || props.shortDescZh || '',
+    tags: props.tags || meta.tags || [],
+    type: props.type || '',
+    website: props.website || '',
+    github: props.github || '',
+    document: props.document || '',
+  };
+}
+
+function storeVersions(id) {
+  const root = safeStorePath('apps', id);
+  return existsSync(root)
+    ? readdirSync(root, { withFileTypes: true }).filter((item) => item.isDirectory() && /^\d+(\.\d+)*$/.test(item.name)).map((item) => item.name)
+      .sort((a, b) => String(a).localeCompare(String(b), 'en', { numeric: true }))
+    : [];
+}
+
+async function composeProjectUnc(project, mustExist = true) {
+  if (!validProjectName(project)) throw new Error('项目名无效');
+  const dir = await resolveComposeDir();
+  const base = await resolveUncBase();
+  const unc = `${base}${dir}\\${project}`.replaceAll('/', '\\');
+  if (mustExist) {
+    const info = await stat(unc).catch(() => null);
+    if (!info?.isDirectory()) throw new Error('项目目录不存在');
+  }
+  return unc;
+}
+
+async function runCompose(project, args, timeout = 180_000) {
+  const dir = await resolveComposeDir();
+  const result = await run('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'bash', '-lc', `cd '${dir}/${project}' && docker compose ${args} 2>&1`], { timeout });
+  if (!result.ok) throw new Error(result.stdout || result.stderr || 'Compose 操作失败');
+  return result;
+}
+
 async function handleAction(pathname, body) {
   if (pathname === '/api/wsl/start') {
     const start = await run('wsl.exe', ['-d', DISTRO, '--exec', 'true'], { timeout: 60_000 });
@@ -370,6 +497,20 @@ async function handleAction(pathname, body) {
     return addActivity(action, name, true, result.stdout || '操作完成');
   }
 
+  // 容器内命令执行（实验性）：在指定容器内运行单条命令
+  const execMatch = pathname.match(/^\/api\/containers\/([^/]+)\/exec$/);
+  if (execMatch) {
+    const name = decodeURIComponent(execMatch[1]);
+    await requireContainer(name);
+    const command = typeof body.cmd === 'string' ? body.cmd.trim() : '';
+    if (!command || command.length > 2000) throw new Error('命令为空或超长（≤2000 字符）');
+    if (/[\r\n]/.test(command)) throw new Error('命令不支持换行');
+    const result = await docker('exec', name, 'sh', '-c', command);
+    const output = `${result.stdout}${result.stderr ? `\n${result.stderr}` : ''}`.trim();
+    await addActivity('exec', name, true, SAFE_TEXT(command, 200));
+    return { __raw: { ok: true, output: SAFE_TEXT(output, 64000) || '（无输出）' } };
+  }
+
   const serviceMatch = pathname.match(/^\/api\/services\/([^/]+)\/(start|stop)$/);
   if (serviceMatch) {
     const name = decodeURIComponent(serviceMatch[1]);
@@ -379,6 +520,93 @@ async function handleAction(pathname, body) {
     const result = await wsl('systemctl', action, unit);
     if (!result.ok) throw new Error(result.stderr || `服务${action}失败`);
     return addActivity(action, name, true, `${name} 服务已${action === 'start' ? '启动' : '停止'}`);
+  }
+
+  const imageMatch = pathname.match(/^\/api\/images\/(delete|prune)$/);
+  if (imageMatch) {
+    const action = imageMatch[1];
+    if (action === 'delete') {
+      const id = typeof body.id === 'string' ? body.id : '';
+      if (!/^[a-f0-9]{6,64}$/i.test(id)) throw new Error('镜像 ID 无效');
+      const result = await docker('rmi', id);
+      if (!result.ok) throw new Error(result.stderr || '镜像删除失败');
+      return addActivity('delete', `image ${id.slice(0, 12)}`, true, result.stdout || '镜像已删除');
+    }
+    const all = body.all === true;
+    const result = await docker('image', 'prune', ...(all ? ['-a'] : []), '-f');
+    if (!result.ok) throw new Error(result.stderr || '镜像清理失败');
+    return addActivity('prune', all ? '全部未使用镜像' : '悬空镜像', true, result.stdout || '清理完成');
+  }
+
+  const volumeMatch = pathname.match(/^\/api\/volumes\/(delete|prune)$/);
+  if (volumeMatch) {
+    const action = volumeMatch[1];
+    if (action === 'delete') {
+      const name = typeof body.name === 'string' ? body.name : '';
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(name)) throw new Error('卷名称无效');
+      const result = await docker('volume', 'rm', name);
+      if (!result.ok) throw new Error(result.stderr || '卷删除失败');
+      return addActivity('delete', `volume ${name}`, true, '卷已删除');
+    }
+    const result = await docker('volume', 'prune', '-a', '-f');
+    if (!result.ok) throw new Error(result.stderr || '卷清理失败');
+    return addActivity('prune', '未使用卷', true, result.stdout || '清理完成');
+  }
+
+  const composeMatch = pathname.match(/^\/api\/compose\/(up|down)$/);
+  if (composeMatch) {
+    const action = composeMatch[1];
+    const project = typeof body.project === 'string' ? body.project : '';
+    await composeProjectUnc(project);
+    const result = await runCompose(project, action === 'up' ? 'up -d' : `down${body.removeVolumes ? ' -v' : ''}`);
+    return addActivity(action, `compose ${project}`, true, result.stdout.slice(-500) || '操作完成');
+  }
+
+  const storeMatch = pathname.match(/^\/api\/store\/(install|uninstall)$/);
+  if (storeMatch) {
+    const action = storeMatch[1];
+    const id = typeof body.id === 'string' ? body.id : '';
+    if (!validAppId(id)) throw new Error('应用 ID 无效');
+    await ensureStore();
+    const versions = storeVersions(id);
+    if (!versions.length) throw new Error('该应用没有可用版本');
+    const version = versions[versions.length - 1];
+    const composeUnc = await composeProjectUnc(id, action === 'uninstall'); // 安装时要求不存在，卸载时要求存在
+
+    if (action === 'install') {
+      if (existsSync(composeUnc)) throw new Error('编排目录中已存在同名项目，请先卸载或改名');
+      const versionMeta = parseYaml(readFileSync(safeStorePath('apps', id, version, 'data.yml'), 'utf8')) || {};
+      const formFields = versionMeta.additionalProperties?.formFields || [];
+      const params = typeof body.params === 'object' && body.params ? body.params : {};
+      const envLines = [`CONTAINER_NAME=${id}`];
+      for (const field of formFields) {
+        const key = String(field.envKey || '');
+        if (!/^[A-Za-z0-9_]+$/.test(key)) continue;
+        let value = String(params[key] ?? field.default ?? '').trim();
+        if (!value && field.required) throw new Error(`缺少必填参数：${field.labelZh || field.labelEn || key}`);
+        if (value) {
+          if (field.rule === 'paramPort' && !/^\d{1,5}$/.test(value)) throw new Error(`端口参数 ${key} 无效`);
+          else if (field.type === 'number' && !/^-?\d+(\.\d+)?$/.test(value)) throw new Error(`参数 ${key} 需为数字`);
+          else if (!/^[A-Za-z0-9_\-.:\/@+= ]*$/.test(value)) throw new Error(`参数 ${key} 含不允许的字符`);
+        }
+        envLines.push(`${key}=${value}`);
+      }
+      const composeText = readFileSync(safeStorePath('apps', id, version, 'docker-compose.yml'), 'utf8');
+      await mkdir(composeUnc, { recursive: true });
+      await writeFile(`${composeUnc}\\docker-compose.yml`, composeText, 'utf8');
+      await writeFile(`${composeUnc}\\.env`, envLines.join('\n') + '\n', 'utf8');
+      if (/^\s*\d+\.\s*external:\s*true/m.test(composeText) || composeText.includes('1panel-network')) {
+        const network = await docker('network', 'inspect', '1panel-network');
+        if (!network.ok) await docker('network', 'create', '1panel-network');
+      }
+      const upResult = await runCompose(id, 'up -d', 300_000);
+      return addActivity('install', `store ${id}`, true, `v${version} 部署完成 ${upResult.stdout.slice(-150)}`);
+    }
+
+    // uninstall
+    const downResult = await runCompose(id, `down${body.removeVolumes ? ' -v' : ''}`);
+    await rm(composeUnc, { recursive: true, force: true });
+    return addActivity('delete', `store ${id}`, true, `已卸载${body.removeVolumes ? '（含卷）' : ''} ${downResult.stdout.slice(-200)}`);
   }
 
   throw new Error('不支持的操作');
@@ -402,7 +630,227 @@ const server = http.createServer(async (request, response) => {
   try {
     if (request.method === 'GET' && url.pathname === '/api/session') return send(response, 200, { token: TOKEN }, origin);
     if (request.method === 'GET' && url.pathname === '/api/status') return send(response, 200, await getStatus(), origin);
+    if (request.method === 'GET' && url.pathname === '/api/images') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const result = await docker('images', '--format', '{{json .}}');
+      const images = parseLines(result.stdout).flatMap((line) => {
+        try {
+          const item = JSON.parse(line);
+          return [{ id: item.ID, repository: item.Repository, tag: item.Tag, size: item.Size, createdSince: item.CreatedSince }];
+        } catch { return []; }
+      });
+      return send(response, 200, { images }, origin);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/volumes') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const [listing, usage] = await Promise.all([
+        docker('volume', 'ls', '--format', '{{json .}}'),
+        docker('system', 'df', '-v'),
+      ]);
+      const sizes = {};
+      const lines = parseLines(usage.stdout);
+      const section = lines.findIndex((line) => line.startsWith('Local Volumes space usage'));
+      if (section >= 0) {
+        for (const line of lines.slice(section + 2)) {
+          const fields = line.trim().split(/\s+/);
+          if (fields.length >= 3) sizes[fields[0]] = { links: fields[1], size: fields[2] };
+        }
+      }
+      const volumes = parseLines(listing.stdout).flatMap((line) => {
+        try {
+          const item = JSON.parse(line);
+          return [{ name: item.Name, driver: item.Driver, links: sizes[item.Name]?.links ?? '—', size: sizes[item.Name]?.size ?? '—' }];
+        } catch { return []; }
+      });
+      return send(response, 200, { volumes }, origin);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/compose/projects') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const dir = await resolveComposeDir();
+      // 以默认用户身份创建（UNC 共享按默认用户校验权限，root 创建会导致后续不可写）
+      await run('wsl.exe', ['-d', DISTRO, '--exec', 'mkdir', '-p', dir]);
+      const base = await resolveUncBase();
+      const rootUnc = `${base}${dir}`.replaceAll('/', '\\');
+      let dirents = [];
+      try { dirents = await readdir(rootUnc, { withFileTypes: true }); } catch { return send(response, 200, { dir, projects: [] }, origin); }
+      const projects = [];
+      for (const dirent of dirents.filter((item) => item.isDirectory())) {
+        let file = null;
+        for (const name of COMPOSE_FILE_NAMES) {
+          if (await access(`${rootUnc}\\${dirent.name}\\${name}`).then(() => true).catch(() => false)) { file = name; break; }
+        }
+        if (file) projects.push({ name: dirent.name, file });
+      }
+      projects.sort((a, b) => a.name.localeCompare(b.name));
+      return send(response, 200, { dir, projects }, origin);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/compose/logs') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const project = url.searchParams.get('project') || '';
+      await composeProjectUnc(project);
+      const tailParam = url.searchParams.get('tail');
+      const tail = ['100', '250', '1000'].includes(tailParam || '') ? tailParam : '250';
+      const result = await runCompose(project, `logs --tail ${tail}`);
+      return send(response, 200, { name: project, logs: result.stdout.trim() }, origin);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/ai/settings') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const config = readAiConfig();
+      return send(response, 200, { baseUrl: config?.baseUrl || '', model: config?.model || '', hasKey: Boolean(config) }, origin);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/ai/settings') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const body = await readBody(request);
+      const baseUrl = SAFE_TEXT(body.baseUrl, 300).replace(/\/$/, '');
+      const apiKey = SAFE_TEXT(body.apiKey, 300);
+      const model = SAFE_TEXT(body.model, 120);
+      if (!/^https?:\/\//.test(baseUrl)) throw new Error('接口地址需以 http(s):// 开头');
+      if (!baseUrl || !apiKey || !model) throw new Error('三项配置均必填');
+      await mkdir(DATA_DIR, { recursive: true });
+      await writeFile(AI_CONFIG_FILE, JSON.stringify({ baseUrl, apiKey, model }, null, 2), 'utf8');
+      return addActivity('save', 'AI 设置', true, `已保存（${model}）`);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/ai/diagnose') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const body = await readBody(request);
+      const name = typeof body.name === 'string' ? body.name : '';
+      await requireContainer(name);
+      const [inspectInfo, logInfo] = await Promise.all([
+        docker('inspect', '--format', '{{.State.Status}} restarts={{.RestartCount}} started={{.State.StartedAt}}', name),
+        docker('logs', '--tail', '120', '--timestamps', name),
+      ]);
+      const prompt = [
+        `容器名: ${name}`,
+        `状态: ${SAFE_TEXT(inspectInfo.stdout, 300)}`,
+        `最近日志:\n${SAFE_TEXT(logInfo.stdout + logInfo.stderr, 6000)}`,
+      ].join('\n\n');
+      const content = await aiChat([
+        { role: 'system', content: '你是容器运维专家。根据容器状态与日志输出诊断：1) 可能的根因 2) 建议的处置步骤（只给文字建议，不要输出命令之外的内容）。用简洁中文回答，最多 300 字。' },
+        { role: 'user', content: prompt },
+      ]);
+      return send(response, 200, { content }, origin);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/ai/generate-compose') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const body = await readBody(request);
+      const content = await aiChat([
+        { role: 'system', content: '你是 Docker Compose 专家。根据用户描述输出一个可直接使用的 compose.yaml，只输出 YAML 内容本身（不要 markdown 代码块标记），使用 compose v2 语法（services: 开头）。镜像优先使用官方源。' },
+        { role: 'user', content: SAFE_TEXT(body.prompt, 2000) },
+      ]);
+      const yaml = content.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+      return send(response, 200, { content: yaml }, origin);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/ai/plan') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const body = await readBody(request);
+      const containersNow = (await getStatus()).containers.map((item) => `${item.name}(${item.running ? 'running' : 'exited'})`).join(', ');
+      const content = await aiChat([
+        { role: 'system', content: '你是容器运维助手。用户会描述期望的容器操作。你只能从这些动作中选择：start（启动容器）、stop（停止容器）、restart（重启容器），target 必须是现有容器名。只输出一个 JSON 数组，形如 [{"action":"restart","target":"name"}]，不要输出任何其他文字。如果需求无法用这些动作表达，输出 []。' },
+        { role: 'user', content: `现有容器: ${containersNow}\n\n用户需求: ${SAFE_TEXT(body.prompt, 1000)}` },
+      ]);
+      let actions = [];
+      try {
+        const match = content.match(/\[[\s\S]*\]/);
+        actions = JSON.parse(match ? match[0] : '[]');
+      } catch { throw new Error('AI 返回的计划无法解析，请换个描述重试'); }
+      const allowed = { start: 1, stop: 1, restart: 1 };
+      actions = (Array.isArray(actions) ? actions : []).slice(0, 10).filter((item) => item && allowed[item.action] && typeof item.target === 'string' && validContainerName(item.target));
+      return send(response, 200, { actions }, origin);
+    }
+
     if (request.method === 'GET' && url.pathname === '/api/activity') return send(response, 200, await readActivity(), origin);
+
+    // ===== 应用商店 =====
+    if (request.method === 'GET' && url.pathname === '/api/store/apps') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      await ensureStore();
+      const appsRoot = safeStorePath('apps');
+      const apps = readdirSync(appsRoot, { withFileTypes: true })
+        .filter((item) => item.isDirectory() && existsSync(path.join(appsRoot, item.name, 'data.yml')))
+        .map((item) => { try { return storeAppMeta(item.name); } catch { return null; } })
+        .filter(Boolean)
+        .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+      return send(response, 200, { source: STORE_REPO, apps }, origin);
+    }
+
+    if (request.method === 'GET' && url.pathname.startsWith('/api/store/logo/')) {
+      const id = decodeURIComponent(url.pathname.slice('/api/store/logo/'.length));
+      if (!validAppId(id)) return send(response, 400, { error: '应用 ID 无效' }, origin);
+      setCors(response, origin);
+      const logo = safeStorePath('apps', id, 'logo.png');
+      if (!existsSync(logo)) { response.statusCode = 404; return response.end(); }
+      response.setHeader('Content-Type', 'image/png');
+      response.setHeader('Cache-Control', 'max-age=86400');
+      response.statusCode = 200;
+      response.end(readFileSync(logo));
+      return;
+    }
+
+    if (request.method === 'GET' && url.pathname.startsWith('/api/store/app/')) {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const id = decodeURIComponent(url.pathname.slice('/api/store/app/'.length));
+      if (!validAppId(id)) throw new Error('应用 ID 无效');
+      await ensureStore();
+      const versions = storeVersions(id);
+      if (!versions.length) throw new Error('该应用没有可用版本');
+      const version = versions[versions.length - 1];
+      const meta = storeAppMeta(id);
+      const versionMeta = parseYaml(readFileSync(safeStorePath('apps', id, version, 'data.yml'), 'utf8')) || {};
+      const formFields = (versionMeta.additionalProperties?.formFields || []).map((field) => ({
+        envKey: String(field.envKey || ''),
+        label: field.label?.zh || field.labelZh || field.label?.en || field.labelEn || String(field.envKey || ''),
+        default: field.default ?? '',
+        required: field.required === true,
+        type: field.type === 'number' ? 'number' : 'text',
+        rule: field.rule || '',
+      })).filter((field) => /^[A-Za-z0-9_]+$/.test(field.envKey));
+      const compose = readFileSync(safeStorePath('apps', id, version, 'docker-compose.yml'), 'utf8');
+      return send(response, 200, { ...meta, version, formFields, compose }, origin);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/store/refresh') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      await rm(STORE_DIR, { recursive: true, force: true });
+      await downloadStore();
+      return addActivity('refresh', '应用商店', true, `模板源已更新（${STORE_REPO}@${STORE_BRANCH}）`);
+    }
+
+    // 实时日志（SSE）：docker logs -f，token 走查询参数（EventSource 无法携带请求头）
+    if (request.method === 'GET' && url.pathname.startsWith('/api/containers/') && url.pathname.endsWith('/follow')) {
+      if (url.searchParams.get('token') !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const name = decodeURIComponent(url.pathname.split('/')[3] || '');
+      const tailParam = url.searchParams.get('tail');
+      const tail = ['100', '250', '1000'].includes(tailParam || '') ? tailParam : '250';
+      await requireContainer(name);
+      setCors(response, origin);
+      response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      response.setHeader('Cache-Control', 'no-store');
+      response.flushHeaders();
+      const child = spawn('wsl.exe', ['-d', DISTRO, '--exec', 'docker', 'logs', '-f', '--tail', tail, name], { windowsHide: true });
+      const push = (payload) => { try { response.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* 连接已断开 */ } };
+      let pending = '';
+      const onChunk = (chunk) => {
+        pending += chunk.toString('utf8');
+        const lines = pending.split(/\r?\n/);
+        pending = lines.pop() || '';
+        for (const line of lines) if (line) push({ line });
+      };
+      child.stdout.on('data', onChunk);
+      child.stderr.on('data', onChunk);
+      child.on('error', () => push({ error: '日志进程启动失败' }));
+      child.on('close', () => { push({ done: true }); response.end(); });
+      const keepAlive = setInterval(() => { try { response.write(': ping\n\n'); } catch { /* 忽略 */ } }, 15000);
+      request.on('close', () => { clearInterval(keepAlive); child.kill(); });
+      return;
+    }
 
     if (request.method === 'GET' && url.pathname === '/api/files/list') {
       if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
@@ -530,6 +978,7 @@ const server = http.createServer(async (request, response) => {
       if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
       const body = await readBody(request);
       const activity = await handleAction(url.pathname, body);
+      if (activity && activity.__raw) return send(response, 200, activity.__raw, origin);
       return send(response, 200, { ok: true, activity }, origin);
     }
 
