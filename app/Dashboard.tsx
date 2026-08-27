@@ -299,7 +299,7 @@ export default function Dashboard() {
     </aside>
 
     <section className="workspace">
-      <header className="topbar"><div><p className="eyebrow">本机控制台</p><h1>WSL2 与 Docker 管理</h1></div><div className="top-actions"><span className="sync-state"><i className={error?'bad':''}/>{error?'连接异常':'每 5 秒刷新'}</span><button className="icon-button" aria-label="刷新" title="立即刷新" onClick={refresh}><Icon name="refresh"/></button><button className="icon-button" aria-label={`主题：${themeName[theme]}（点击切换）`} title={`主题：${themeName[theme]}（点击切换）`} onClick={()=>setTheme(mode=>mode==='auto'?'light':mode==='light'?'dark':'auto')}><Icon name={theme==='auto'?'theme-auto':theme==='light'?'theme-sun':'theme-moon'}/></button></div></header>
+      <header className="topbar"><div><p className="eyebrow">本机优先 · Local-first</p><h1>WSL2 与 Docker 的驾驶舱</h1></div><div className="top-actions"><span className="sync-state"><i className={error?'bad':''}/>{error?'连接异常':'每 5 秒刷新'}</span><button className="icon-button" aria-label="刷新" title="立即刷新" onClick={refresh}><Icon name="refresh"/></button><button className="icon-button" aria-label={`主题：${themeName[theme]}（点击切换）`} title={`主题：${themeName[theme]}（点击切换）`} onClick={()=>setTheme(mode=>mode==='auto'?'light':mode==='light'?'dark':'auto')}><Icon name={theme==='auto'?'theme-auto':theme==='light'?'theme-sun':'theme-moon'}/></button></div></header>
       <div className="content">
         {(error||notice)&&<div className={error?'toast error':'toast success'} role="status">{error||notice}<button onClick={()=>{setError('');setNotice('')}} aria-label="关闭">×</button></div>}
 

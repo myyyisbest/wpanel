@@ -1,5 +1,7 @@
 # WPanel
 
+> **WSL2 与 Docker 的本机驾驶舱** —— 为 Windows 而生的轻量管理面板：零 agent 文件管理、Compose 编排、应用商店，以及只提建议、不碰键盘的 AI 副驾驶。
+
 **English** | WPanel 是面向 Windows 本机的 WSL2 与 Docker 可视化管理面板。它运行在 Windows 侧，通过 `wsl.exe` 与 `\\wsl.localhost` 直接管理 WSL2 发行版、原生 Docker 服务与文件系统，无需在 Linux 内安装任何组件。
 
 > For: Windows 11 + WSL2 + native dockerd (systemd) + Node.js 22+
