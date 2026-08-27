@@ -6,7 +6,7 @@ import { appendFile, mkdir, readFile, readdir, rename, rm, stat, realpath, acces
 import { existsSync, readFileSync, readdirSync, createReadStream, createWriteStream } from 'node:fs';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -374,18 +374,43 @@ function validProjectName(name) {
 const STORE_DIR = path.join(DATA_DIR, 'store-cache', 'appstore');
 const STORE_REPO_DEFAULT = process.env.WPANEL_STORE_REPO || 'https://github.com/1Panel-dev/appstore';
 const STORE_BRANCH_DEFAULT = process.env.WPANEL_STORE_BRANCH || 'main';
-// 模板源可在界面修改，持久化在 data/wpanel.local.json 的 store 段（不进 git）
+// 模板源可在界面修改，持久化在 data/wpanel.local.json 的 store 段（不进 git）；
+// mirror 为 docker.io 镜像加速站（安装时改写镜像地址），默认 docker.1ms.run，留空则直连
 function readStoreConfig() {
-  const fallback = { repo: STORE_REPO_DEFAULT, branch: STORE_BRANCH_DEFAULT };
+  const fallback = { repo: STORE_REPO_DEFAULT, branch: STORE_BRANCH_DEFAULT, mirror: 'docker.1ms.run' };
   try {
     const parsed = JSON.parse(readFileSync(LOCAL_CONFIG_FILE, 'utf8'));
     const repo = parsed?.store?.repo;
     const branch = parsed?.store?.branch;
+    const mirror = parsed?.store?.mirror;
     return {
       repo: typeof repo === 'string' && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?$/.test(repo) ? repo.replace(/\.git$/, '') : fallback.repo,
       branch: typeof branch === 'string' && /^[\w.-]{1,64}$/.test(branch) ? branch : fallback.branch,
+      mirror: mirror == null ? fallback.mirror : (typeof mirror === 'string' && /^[a-z0-9][a-z0-9.-]*(:\d+)?$/.test(mirror) ? mirror : ''),
     };
   } catch { return fallback; }
+}
+
+// 仅改写 docker.io 镜像（显式或隐式）；其他 registry（ghcr/quay/私有）保持原样
+function mirrorImageRef(image, mirror) {
+  const name = image.replace(/^docker\.io\//, '');
+  const firstSegment = name.split('/')[0];
+  const hasExplicitRegistry = firstSegment.includes('.') || firstSegment.includes(':');
+  return hasExplicitRegistry ? name : `${mirror}/${name}`;
+}
+
+function applyImageMirror(composeText, mirror) {
+  if (!mirror) return composeText;
+  try {
+    const doc = parseYaml(composeText);
+    const services = doc?.services;
+    if (services && typeof services === 'object') {
+      for (const service of Object.values(services)) {
+        if (service && typeof service.image === 'string') service.image = mirrorImageRef(service.image, mirror);
+      }
+    }
+    return stringifyYaml(doc);
+  } catch { return composeText; }
 }
 const validAppId = (id) => typeof id === 'string' && /^[a-z0-9][a-z0-9._-]{0,127}$/.test(id);
 
@@ -450,6 +475,38 @@ function storeVersions(id) {
     ? readdirSync(root, { withFileTypes: true }).filter((item) => item.isDirectory() && /^\d+(\.\d+)*$/.test(item.name)).map((item) => item.name)
       .sort((a, b) => String(a).localeCompare(String(b), 'en', { numeric: true }))
     : [];
+}
+
+function storeFormFields(id, version) {
+  const versionMeta = parseYaml(readFileSync(safeStorePath('apps', id, version, 'data.yml'), 'utf8')) || {};
+  return (versionMeta.additionalProperties?.formFields || []).map((field) => ({
+    envKey: String(field.envKey || ''),
+    label: field.label?.zh || field.labelZh || field.label?.en || field.labelEn || String(field.envKey || ''),
+    default: field.default ?? '',
+    required: field.required === true,
+    type: field.type === 'number' ? 'number' : 'text',
+    rule: field.rule || '',
+  })).filter((field) => /^[A-Za-z0-9_]+$/.test(field.envKey));
+}
+
+// 安装渲染：表单参数 → .env；镜像按加速站设置改写。预览与安装共用，保证所见即所装
+function renderStoreInstall(id, version, params) {
+  const formFields = storeFormFields(id, version);
+  const input = typeof params === 'object' && params ? params : {};
+  const envLines = [`CONTAINER_NAME=${id}`];
+  for (const field of formFields) {
+    const key = field.envKey;
+    let value = String(input[key] ?? field.default ?? '').trim();
+    if (!value && field.required) throw new Error(`缺少必填参数：${field.label}`);
+    if (value) {
+      if (field.rule === 'paramPort' && !/^\d{1,5}$/.test(value)) throw new Error(`端口参数 ${key} 无效`);
+      else if (field.type === 'number' && !/^-?\d+(\.\d+)?$/.test(value)) throw new Error(`参数 ${key} 需为数字`);
+      else if (!/^[A-Za-z0-9_\-.:\/@+= ]*$/.test(value)) throw new Error(`参数 ${key} 含不允许的字符`);
+    }
+    envLines.push(`${key}=${value}`);
+  }
+  const rawCompose = readFileSync(safeStorePath('apps', id, version, 'docker-compose.yml'), 'utf8');
+  return { compose: applyImageMirror(rawCompose, readStoreConfig().mirror), envText: envLines.join('\n') + '\n', rawCompose };
 }
 
 async function composeProjectUnc(project, mustExist = true) {
@@ -598,28 +655,12 @@ async function handleAction(pathname, body) {
 
     if (action === 'install') {
       if (existsSync(composeUnc)) throw new Error('编排目录中已存在同名项目，请先卸载或改名');
-      const versionMeta = parseYaml(readFileSync(safeStorePath('apps', id, version, 'data.yml'), 'utf8')) || {};
-      const formFields = versionMeta.additionalProperties?.formFields || [];
-      const params = typeof body.params === 'object' && body.params ? body.params : {};
-      const envLines = [`CONTAINER_NAME=${id}`];
-      for (const field of formFields) {
-        const key = String(field.envKey || '');
-        if (!/^[A-Za-z0-9_]+$/.test(key)) continue;
-        let value = String(params[key] ?? field.default ?? '').trim();
-        if (!value && field.required) throw new Error(`缺少必填参数：${field.labelZh || field.labelEn || key}`);
-        if (value) {
-          if (field.rule === 'paramPort' && !/^\d{1,5}$/.test(value)) throw new Error(`端口参数 ${key} 无效`);
-          else if (field.type === 'number' && !/^-?\d+(\.\d+)?$/.test(value)) throw new Error(`参数 ${key} 需为数字`);
-          else if (!/^[A-Za-z0-9_\-.:\/@+= ]*$/.test(value)) throw new Error(`参数 ${key} 含不允许的字符`);
-        }
-        envLines.push(`${key}=${value}`);
-      }
+      const rendered = renderStoreInstall(id, version, body.params);
       const upArgs = 'up -d';
-      const composeText = readFileSync(safeStorePath('apps', id, version, 'docker-compose.yml'), 'utf8');
       await mkdir(composeUnc, { recursive: true });
-      await writeFile(`${composeUnc}\\docker-compose.yml`, composeText, 'utf8');
-      await writeFile(`${composeUnc}\\.env`, envLines.join('\n') + '\n', 'utf8');
-      if (composeText.includes('1panel-network')) {
+      await writeFile(`${composeUnc}\\docker-compose.yml`, rendered.compose, 'utf8');
+      await writeFile(`${composeUnc}\\.env`, rendered.envText, 'utf8');
+      if (rendered.rawCompose.includes('1panel-network')) {
         const network = await docker('network', 'inspect', '1panel-network');
         if (!network.ok) await docker('network', 'create', '1panel-network');
       }
@@ -821,7 +862,7 @@ const server = http.createServer(async (request, response) => {
         .filter(Boolean)
         .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
       const storeConfig = readStoreConfig();
-      return send(response, 200, { source: `${storeConfig.repo}@${storeConfig.branch}`, apps }, origin);
+      return send(response, 200, { source: `${storeConfig.repo}@${storeConfig.branch}`, mirror: storeConfig.mirror, apps }, origin);
     }
 
     if (request.method === 'POST' && url.pathname === '/api/store/source') {
@@ -829,15 +870,19 @@ const server = http.createServer(async (request, response) => {
       const body = await readBody(request);
       const repo = SAFE_TEXT(body.repo, 300).replace(/\/$/, '').replace(/\.git$/, '');
       const branch = SAFE_TEXT(body.branch, 64) || 'main';
+      const mirror = typeof body.mirror === 'string' ? body.mirror.trim() : '';
       if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error('模板源需为 GitHub 仓库地址（https://github.com/用户/仓库）');
       if (!/^[\w.-]{1,64}$/.test(branch)) throw new Error('分支名无效');
+      if (mirror && !/^[a-z0-9][a-z0-9.-]*(:\d+)?$/.test(mirror)) throw new Error('加速站地址无效（形如 docker.1ms.run）');
+      const previous = readStoreConfig();
       await mkdir(DATA_DIR, { recursive: true });
       let local = {};
       try { local = JSON.parse(readFileSync(LOCAL_CONFIG_FILE, 'utf8')); } catch { local = {}; }
-      local.store = { repo, branch };
+      local.store = { repo, branch, mirror };
       await writeFile(LOCAL_CONFIG_FILE, JSON.stringify(local, null, 2), 'utf8');
-      await rm(STORE_DIR, { recursive: true, force: true });
-      return addActivity('save', '商店模板源', true, `${repo}@${branch}（下次打开商店时重新下载）`);
+      // 仅当仓库/分支变化时才清缓存重新下载；加速站变化即时生效
+      if (repo !== previous.repo || branch !== previous.branch) await rm(STORE_DIR, { recursive: true, force: true });
+      return addActivity('save', '商店模板源', true, `${repo}@${branch}${mirror ? ` · 加速站 ${mirror}` : ' · 直连'}`);
     }
 
     if (request.method === 'GET' && url.pathname.startsWith('/api/store/job/')) {
@@ -871,17 +916,21 @@ const server = http.createServer(async (request, response) => {
       if (!versions.length) throw new Error('该应用没有可用版本');
       const version = versions[versions.length - 1];
       const meta = storeAppMeta(id);
-      const versionMeta = parseYaml(readFileSync(safeStorePath('apps', id, version, 'data.yml'), 'utf8')) || {};
-      const formFields = (versionMeta.additionalProperties?.formFields || []).map((field) => ({
-        envKey: String(field.envKey || ''),
-        label: field.label?.zh || field.labelZh || field.label?.en || field.labelEn || String(field.envKey || ''),
-        default: field.default ?? '',
-        required: field.required === true,
-        type: field.type === 'number' ? 'number' : 'text',
-        rule: field.rule || '',
-      })).filter((field) => /^[A-Za-z0-9_]+$/.test(field.envKey));
-      const compose = readFileSync(safeStorePath('apps', id, version, 'docker-compose.yml'), 'utf8');
-      return send(response, 200, { ...meta, version, formFields, compose }, origin);
+      return send(response, 200, { ...meta, version, formFields: storeFormFields(id, version), mirror: readStoreConfig().mirror }, origin);
+    }
+
+    // 安装预览：与真实安装共用同一渲染逻辑（参数校验 + .env + 镜像加速改写）
+    if (request.method === 'POST' && url.pathname === '/api/store/render') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const body = await readBody(request);
+      const id = typeof body.id === 'string' ? body.id : '';
+      if (!validAppId(id)) throw new Error('应用 ID 无效');
+      await ensureStore();
+      const versions = storeVersions(id);
+      if (!versions.length) throw new Error('该应用没有可用版本');
+      const version = versions[versions.length - 1];
+      const rendered = renderStoreInstall(id, version, body.params);
+      return send(response, 200, { compose: rendered.compose, env: rendered.envText, mirror: readStoreConfig().mirror }, origin);
     }
 
     if (request.method === 'POST' && url.pathname === '/api/store/refresh') {
