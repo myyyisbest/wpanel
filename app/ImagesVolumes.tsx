@@ -1,9 +1,10 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 type ImageItem = { id:string; repository:string; tag:string; size:string; createdSince:string };
 type VolumeItem = { name:string; driver:string; links:string; size:string };
+type JobState = { id:string; status:'running'|'done'|'error'; output:string; label:string };
 
 export default function ImagesVolumes({ token, notify }:{ token:string;notify:(type:'ok'|'err',message:string)=>void }) {
   const [images,setImages] = useState<ImageItem[]|null>(null);
@@ -11,6 +12,9 @@ export default function ImagesVolumes({ token, notify }:{ token:string;notify:(t
   const [error,setError] = useState('');
   const [busy,setBusy] = useState('');
   const [busyKey,setBusyKey] = useState('');
+  const [job,setJob] = useState<JobState|null>(null);
+  const importRef = useRef<HTMLInputElement>(null);
+  const jobLogRef = useRef<HTMLPreElement>(null);
 
   const locked = (key='') => !token || (Boolean(busy) && (busyKey === '' || busyKey === key));
 
@@ -35,6 +39,67 @@ export default function ImagesVolumes({ token, notify }:{ token:string;notify:(t
     if (token) load();
   },[token,load]);
 
+  // 拉取任务进度轮询
+  useEffect(() => {
+    if (!job || job.status !== 'running' || !token) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const response = await fetch(`${__WPANEL_API__}/api/store/job/${job.id}`,{headers:{'X-WPanel-Token':token},cache:'no-store'});
+        const data = await response.json() as {status?:JobState['status'];output?:string};
+        if (!response.ok) { setJob((current) => current ? { ...current,status:'error',output:current.output+'\n任务查询失败' } : current); return; }
+        setJob((current) => current && current.id === job.id ? { ...current, status:data.status || 'running', output:data.output || '' } : current);
+        if (data.status === 'done') load();
+      } catch { /* 单次轮询失败忽略 */ }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  },[job,token,load]);
+
+  useEffect(() => { if (job && jobLogRef.current) jobLogRef.current.scrollTop = jobLogRef.current.scrollHeight; },[job?.output]);
+
+  function pullImage() {
+    const image = window.prompt('要拉取的镜像名（自动套用商店加速站设置）\n例如：nginx:alpine 或 b3log/siyuan:v3.8.1');
+    if (!image || !image.trim()) return;
+    setBusy('提交拉取任务');setBusyKey('pull');
+    (async () => {
+      try {
+        const response = await fetch(`${__WPANEL_API__}/api/images/pull`,{method:'POST',headers:{'Content-Type':'application/json','X-WPanel-Token':token},body:JSON.stringify({image:image.trim()})});
+        const result = await response.json() as {jobId?:string;target?:string;error?:string};
+        if (!response.ok || !result.jobId) throw new Error(result.error || '任务提交失败');
+        setJob({ id:result.jobId, status:'running', output:`docker pull ${result.target||image.trim()}\n`, label:image.trim() });
+      } catch (reason) { notify('err',reason instanceof Error?reason.message:'提交失败'); }
+      finally { setBusy('');setBusyKey(''); }
+    })();
+  }
+
+  async function exportImage(image:ImageItem) {
+    setBusy(`导出 ${image.repository}`);setBusyKey(image.id);
+    try {
+      const response = await fetch(`${__WPANEL_API__}/api/images/export?id=${encodeURIComponent(image.id)}`,{headers:{'X-WPanel-Token':token},cache:'no-store'});
+      if (!response.ok) { const failed = await response.json().catch(()=>({})) as {error?:string}; throw new Error(failed.error || '导出失败'); }
+      const blob = await response.blob();
+      const anchor = document.createElement('a');
+      anchor.href = URL.createObjectURL(blob);anchor.download = `${image.repository.replace(/[\/:]/g,'_')}_${image.tag}.tar`;anchor.click();
+      URL.revokeObjectURL(anchor.href);
+      notify('ok',`${image.repository}:${image.tag} 已开始下载`);
+    } catch (reason) { notify('err',reason instanceof Error?reason.message:'导出失败'); }
+    finally { setBusy('');setBusyKey(''); }
+  }
+
+  async function importImage(event:React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!window.confirm(`导入 ${file.name}（${(file.size/1048576).toFixed(1)} MB）？镜像较大时需要几分钟。`)) return;
+    setBusy(`导入 ${file.name}`);setBusyKey('import');
+    try {
+      const response = await fetch(`${__WPANEL_API__}/api/images/import`,{method:'POST',headers:{'X-WPanel-Token':token},body:file});
+      const result = await response.json() as {error?:string};
+      if (!response.ok) throw new Error(result.error || '导入失败');
+      notify('ok','镜像导入完成');await load();
+    } catch (reason) { notify('err',reason instanceof Error?reason.message:'导入失败'); }
+    finally { setBusy('');setBusyKey(''); }
+  }
+
   async function mutate(label:string,url:string,body:Record<string,unknown>,key:string) {
     setBusy(label);setBusyKey(key);
     try {
@@ -53,8 +118,17 @@ export default function ImagesVolumes({ token, notify }:{ token:string;notify:(t
 
     {error&&<div className="empty-state" style={{marginBottom:14}}>{error}</div>}
 
+    {job&&<div className="file-card" style={{marginBottom:16,padding:'14px 16px'}}>
+      <div className={`install-banner ${job.status}`} style={{marginBottom:10}}>{job.status==='running'?`正在拉取 ${job.label}（自动套用加速站），日志实时输出…`:job.status==='done'?`✓ ${job.label} 拉取完成`:`✗ ${job.label} 拉取失败`}</div>
+      <pre ref={jobLogRef} className="store-compose install-log">{job.output||'…'}</pre>
+      {job.status!=='running'&&<div style={{marginTop:10,display:'flex',gap:8}}><button className="mini-button ghost" onClick={()=>setJob(null)}>关闭</button></div>}
+    </div>}
+
     <div className="section-title" style={{margin:'6px 0 10px'}}><div><h3 style={{margin:0,fontSize:15}}>镜像 <small style={{color:'var(--faint)',fontSize:11,fontWeight:400}}>{images?.length ?? '…'} 个</small></h3></div>
       <div className="section-tools">
+        <button className="mini-button" disabled={locked('pull')} onClick={pullImage}>拉取镜像</button>
+        <button className="mini-button ghost" disabled={locked('import')} onClick={()=>importRef.current?.click()}>导入镜像</button>
+        <input ref={importRef} type="file" accept=".tar,.tar.gz,.tgz" hidden onChange={importImage} aria-hidden="true"/>
         <button className="mini-button ghost" disabled={locked('prune-dangling')} onClick={()=>{if(window.confirm('清理所有悬空镜像（无标签的中间层）？'))mutate('清理悬空镜像','/api/images/prune',{},'prune-dangling')}}>清理悬空</button>
         <button className="mini-button ghost" disabled={locked('prune-all')} onClick={()=>{if(window.confirm('清理所有未被容器使用的镜像？正在运行的容器不受影响，但相关镜像需要重新拉取。确认继续吗？'))mutate('清理未使用镜像','/api/images/prune',{all:true},'prune-all')}}>清理未使用</button>
         <button className="mini-button ghost" onClick={()=>load()}>刷新</button>
@@ -67,7 +141,7 @@ export default function ImagesVolumes({ token, notify }:{ token:string;notify:(t
           <td><span className="container-id">{image.id}</span></td>
           <td className="f-size">{image.size}</td>
           <td className="f-size">{image.createdSince}</td>
-          <td><span className="f-actions"><button className="mini-button ghost" disabled={locked(image.id)} onClick={()=>{if(window.confirm(`删除镜像 ${image.repository}:${image.tag}？`))mutate('删除镜像','/api/images/delete',{id:image.id},image.id)}}>删除</button></span></td>
+          <td><span className="f-actions"><button className="mini-button ghost" disabled={locked(image.id)} onClick={()=>exportImage(image)} title="docker save 导出为 tar 下载">导出</button><button className="mini-button ghost" disabled={locked(image.id)} onClick={()=>{if(window.confirm(`删除镜像 ${image.repository}:${image.tag}？`))mutate('删除镜像','/api/images/delete',{id:image.id},image.id)}}>删除</button></span></td>
         </tr>)}
         {images?.length===0&&<tr><td colSpan={5} className="f-none">没有镜像</td></tr>}
       </tbody>

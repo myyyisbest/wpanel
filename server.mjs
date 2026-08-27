@@ -394,8 +394,11 @@ function readStoreConfig() {
 // 仅改写 docker.io 镜像（显式或隐式）；其他 registry（ghcr/quay/私有）保持原样
 function mirrorImageRef(image, mirror) {
   const name = image.replace(/^docker\.io\//, '');
-  const firstSegment = name.split('/')[0];
-  const hasExplicitRegistry = firstSegment.includes('.') || firstSegment.includes(':');
+  const slash = name.indexOf('/');
+  // 无路径段（如 busybox:latest、nginx）→ docker.io 隐式镜像；有路径段才可能带 registry 主机
+  if (slash === -1) return `${mirror}/${name}`;
+  const host = name.slice(0, slash);
+  const hasExplicitRegistry = host.includes('.') || host.includes(':');
   return hasExplicitRegistry ? name : `${mirror}/${name}`;
 }
 
@@ -589,6 +592,48 @@ async function handleAction(pathname, body) {
     const output = `${result.stdout}${result.stderr ? `\n${result.stderr}` : ''}`.trim();
     await addActivity('exec', name, true, SAFE_TEXT(command, 200));
     return { __raw: { ok: true, output: SAFE_TEXT(output, 64000) || '（无输出）' } };
+  }
+
+  // 删除单个容器（须先停止）与批量清理已停止容器
+  const removeMatch = pathname.match(/^\/api\/containers\/([^/]+)\/remove$/);
+  if (removeMatch) {
+    const name = decodeURIComponent(removeMatch[1]);
+    await requireContainer(name);
+    const result = await docker('rm', name);
+    if (!result.ok) throw new Error(result.stderr || '容器删除失败');
+    return addActivity('delete', name, true, '容器已删除');
+  }
+
+  if (pathname === '/api/containers/prune') {
+    const result = await docker('container', 'prune', '-f');
+    if (!result.ok) throw new Error(result.stderr || '清理失败');
+    return addActivity('prune', '已停止容器', true, result.stdout || '清理完成');
+  }
+
+  // 手动拉取镜像（自动套用商店加速站设置），后台任务流式输出
+  if (pathname === '/api/images/pull') {
+    const image = typeof body.image === 'string' ? body.image.trim() : '';
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._\/:-]{1,200}$/.test(image)) throw new Error('镜像名无效');
+    const { mirror } = readStoreConfig();
+    const target = mirror ? mirrorImageRef(image, mirror) : image;
+    const jobId = randomUUID().replaceAll('-', '');
+    const job = { status: 'running', output: `docker pull ${target}\n` };
+    installJobs.set(jobId, job);
+    pruneInstallJobs();
+    const child = spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'docker', 'pull', target], { windowsHide: true });
+    const append = (chunk) => {
+      job.output += chunk.toString('utf8');
+      if (job.output.length > 120000) job.output = job.output.slice(-90000);
+    };
+    child.stdout.on('data', append);
+    child.stderr.on('data', append);
+    child.on('error', (error) => { job.status = 'error'; job.output += `\n${error.message}`; });
+    child.on('close', (code) => {
+      job.status = code === 0 ? 'done' : 'error';
+      job.output += `\n[进程退出码 ${code}]`;
+      addActivity('download', target, code === 0, code === 0 ? '镜像拉取完成' : '镜像拉取失败').catch(() => {});
+    });
+    return { __raw: { ok: true, jobId, target } };
   }
 
   const serviceMatch = pathname.match(/^\/api\/services\/([^/]+)\/(start|stop)$/);
@@ -847,6 +892,98 @@ const server = http.createServer(async (request, response) => {
       const allowed = { start: 1, stop: 1, restart: 1 };
       actions = (Array.isArray(actions) ? actions : []).slice(0, 10).filter((item) => item && allowed[item.action] && typeof item.target === 'string' && validContainerName(item.target));
       return send(response, 200, { actions }, origin);
+    }
+
+    if (request.method === 'GET' && url.pathname.startsWith('/api/containers/') && url.pathname.endsWith('/inspect')) {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const name = decodeURIComponent(url.pathname.split('/')[3] || '');
+      await requireContainer(name);
+      const result = await docker('inspect', '--format', '{{json .}}', name);
+      let summary;
+      try {
+        const item = JSON.parse(result.stdout);
+        summary = {
+          name: String(item.Name || '').replace(/^\//, ''),
+          image: item.Config?.Image || '',
+          status: item.State?.Status || '',
+          startedAt: item.State?.StartedAt || '',
+          restartCount: item.RestartCount ?? 0,
+          restartPolicy: item.HostConfig?.RestartPolicy?.Name || 'no',
+          ports: Object.entries(item.NetworkSettings?.Ports || {}).flatMap(([key, bindings]) => (bindings || []).map((binding) => `${binding.HostIp}:${binding.HostPort} → ${key}`)),
+          mounts: (item.Mounts || []).map((mount) => `${mount.Source || mount.Name || '?'} → ${mount.Destination}${mount.Mode ? ` (${mount.Mode})` : ''}`),
+          networks: Object.keys(item.NetworkSettings?.Networks || {}),
+          env: (item.Config?.Env || []).slice(0, 40),
+        };
+      } catch { throw new Error('inspect 输出解析失败'); }
+      return send(response, 200, summary, origin);
+    }
+
+    // 镜像导出：docker save 流式返回 tar（优先按 仓库:标签 导出，保留名称信息）
+    if (request.method === 'GET' && url.pathname === '/api/images/export') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const id = url.searchParams.get('id') || '';
+      if (!/^[a-f0-9]{6,64}$/i.test(id)) throw new Error('镜像 ID 无效');
+      const check = await docker('inspect', id);
+      if (!check.ok) throw new Error('镜像不存在');
+      let reference = id;
+      let fileName = `image-${id.slice(0, 12)}`;
+      const list = await docker('images', '--format', '{{json .}}');
+      for (const line of parseLines(list.stdout)) {
+        try {
+          const item = JSON.parse(line);
+          if (item.ID && String(item.ID).startsWith(id) && item.Repository && item.Repository !== '<none>') {
+            reference = `${item.Repository}:${item.Tag}`;
+            fileName = `${String(item.Repository).replace(/[^\w.-]+/g, '_')}_${item.Tag}`;
+            break;
+          }
+        } catch { /* 跳过无法解析的行 */ }
+      }
+      setCors(response, origin);
+      response.setHeader('Content-Type', 'application/x-tar');
+      response.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}.tar`);
+      response.setHeader('Cache-Control', 'no-store');
+      response.flushHeaders();
+      const child = spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'docker', 'save', reference], { windowsHide: true });
+      child.stdout.pipe(response);
+      child.stderr.on('data', () => { try { response.destroy(); } catch { /* 已断开 */ } });
+      child.on('error', () => { try { response.destroy(); } catch { /* 已断开 */ } });
+      request.on('close', () => child.kill());
+      return;
+    }
+
+    // 镜像导入：请求体为 docker save 的 tar 流，上限 2GB
+    if (request.method === 'POST' && url.pathname === '/api/images/import') {
+      if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
+      const tmpPath = path.join(DATA_DIR, 'import.tar');
+      let total = 0;
+      const limit = new Transform({
+        transform(chunk, encoding, callback) {
+          total += chunk.length;
+          if (total > 2 * 1024 * 1024 * 1024) { callback(new Error('文件超过 2GB 上限')); return; }
+          callback(null, chunk);
+        },
+      });
+      try {
+        await pipeline(request, limit, createWriteStream(tmpPath));
+        const child = spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'docker', 'load'], { windowsHide: true });
+        const loadResult = await Promise.all([
+          pipeline(createReadStream(tmpPath), child.stdin).then(() => 'loaded'),
+          new Promise((resolve) => {
+            let output = '';
+            child.stdout.on('data', (chunk) => { output += chunk.toString('utf8'); });
+            child.stderr.on('data', (chunk) => { output += chunk.toString('utf8'); });
+            child.on('close', (code) => resolve({ code, output: output.slice(-500) }));
+            child.on('error', (error) => resolve({ code: 1, output: error.message }));
+          }),
+        ]);
+        const outcome = loadResult[1];
+        await rm(tmpPath, { force: true });
+        if (outcome.code !== 0) throw new Error(outcome.output || '导入失败');
+        return addActivity('install', '镜像导入', true, outcome.output);
+      } catch (error) {
+        await rm(tmpPath, { force: true }).catch(() => {});
+        throw error;
+      }
     }
 
     if (request.method === 'GET' && url.pathname === '/api/activity') return send(response, 200, await readActivity(), origin);

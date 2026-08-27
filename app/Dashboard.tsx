@@ -79,6 +79,8 @@ export default function Dashboard() {
   const [logTail,setLogTail] = useState('250');
   const [logFollow,setLogFollow] = useState(false);
   const [execView,setExecView] = useState<{name:string;cmd:string;output:string}|null>(null);
+  const [detailView,setDetailView] = useState<string|null>(null);
+  const [detailData,setDetailData] = useState<Record<string,unknown>|null>(null);
   const [theme,setTheme] = useState<ThemeMode>('auto');
   const [view,setView] = useState<'overview'|'containers'|'images'|'compose'|'store'|'files'|'ai'|'activity'>('overview');
   const [containerView,setContainerView] = useState<'cards'|'list'>('cards');
@@ -169,6 +171,13 @@ export default function Dashboard() {
     return ()=>window.removeEventListener('keydown',onKey);
   },[execView]);
 
+  useEffect(() => {
+    if (!detailView) return;
+    const onKey=(event:KeyboardEvent)=>{ if(event.key==='Escape') setDetailView(null); };
+    window.addEventListener('keydown',onKey);
+    return ()=>window.removeEventListener('keydown',onKey);
+  },[detailView]);
+
   async function runExec(name:string,cmd:string) {
     if (!cmd.trim()) return;
     setBusy(`执行命令`);setBusyKey(name);
@@ -180,6 +189,28 @@ export default function Dashboard() {
     }
     catch(reason){ notify('err',reason instanceof Error?reason.message:'执行失败'); }
     finally{setBusy('');setBusyKey('')}
+  }
+
+  async function openDetail(name:string) {
+    setDetailView(name);setDetailData(null);
+    try {
+      const response=await fetch(`${API}/api/containers/${encodeURIComponent(name)}/inspect`,{headers:{'X-WPanel-Token':token},cache:'no-store'});
+      const result=await response.json() as Record<string,unknown>&{error?:string};
+      if(!response.ok)throw new Error(result.error||'详情读取失败');
+      setDetailData(result);
+    }
+    catch(reason){ setDetailView(null); notify('err',reason instanceof Error?reason.message:'详情读取失败'); }
+  }
+
+  function removeContainer(name:string) {
+    if (!window.confirm(`删除容器 ${name}？仅删除容器本身，镜像和数据卷不受影响。`)) return;
+    act(`删除容器 ${name}`,`/api/containers/${encodeURIComponent(name)}/remove`,{},name);
+  }
+
+  function pruneStoppedContainers() {
+    const stopped=(status?.containers||[]).filter(container=>!container.running).length;
+    if (!window.confirm(`清理全部 ${stopped} 个已停止的容器？仅删除容器，镜像与数据卷保留。`)) return;
+    act('清理已停止容器','/api/containers/prune');
   }
 
   useEffect(() => { if (logView && logBodyRef.current) logBodyRef.current.scrollTop = logBodyRef.current.scrollHeight; },[logView]);
@@ -320,13 +351,13 @@ export default function Dashboard() {
           </article></>}
         </section></div>
 
-        <div className="view-fade" hidden={view!=='containers'}><section className="section-block"><div className="section-title"><div><h2>容器</h2><p>{dockerOn?`共 ${status?.docker.totalContainers||0} 个，其中 ${status?.docker.runningContainers||0} 个运行中`:'Docker 启动后显示容器'}</p></div><div className="section-tools"><div className="seg" role="group" aria-label="视图切换"><button className={containerView==='cards'?'active':''} onClick={()=>setContainerView('cards')}><Icon name="overview" size={13}/>卡片</button><button className={containerView==='list'?'active':''} onClick={()=>setContainerView('list')}><Icon name="list" size={13}/>列表</button></div><input aria-label="搜索容器" value={query} onChange={event=>setQuery(event.target.value)} placeholder="搜索容器"/></div></div>
+        <div className="view-fade" hidden={view!=='containers'}><section className="section-block"><div className="section-title"><div><h2>容器</h2><p>{dockerOn?`共 ${status?.docker.totalContainers||0} 个，其中 ${status?.docker.runningContainers||0} 个运行中`:'Docker 启动后显示容器'}</p></div><div className="section-tools"><div className="seg" role="group" aria-label="视图切换"><button className={containerView==='cards'?'active':''} onClick={()=>setContainerView('cards')}><Icon name="overview" size={13}/>卡片</button><button className={containerView==='list'?'active':''} onClick={()=>setContainerView('list')}><Icon name="list" size={13}/>列表</button></div><input aria-label="搜索容器" value={query} onChange={event=>setQuery(event.target.value)} placeholder="搜索容器"/>{dockerOn&&!loading&&(status?.docker.totalContainers||0)>(status?.docker.runningContainers||0)&&<button className="mini-button ghost" disabled={Boolean(busy)} onClick={pruneStoppedContainers}>清理已停止</button>}</div></div>
           {containerView==='cards'?<div className="container-grid">
             {loading?[0,1,2,3].map(index=><article className="container-card" key={index}><div className="skeleton line w33"/><div className="skeleton line w60 tall"/><div className="skeleton line w80"/><div className="skeleton line w50"/></article>)
             :visibleContainers.map(container=>{
               const ports=hostPorts(container.ports);
-              return <article className="container-card" key={container.id}><div className="container-top"><span className="container-logo">{container.name.slice(0,1).toUpperCase()}</span><span className="container-id">{container.id.slice(0,8)}</span></div><div><span className="group-label">{container.project||'独立容器'}</span><h3>{container.name}</h3><p title={container.image}>{container.image}</p></div><div className="container-meta"><span className={container.running?'state running':'state stopped'}><i/>{container.running?'运行中':'已停止'}</span><span className="container-status" title={container.status}>{container.status||container.state}</span></div>{ports.length>0&&<div className="port-row">{ports.map(port=><a className="port-chip" key={port} href={`http://localhost:${port}`} target="_blank" rel="noreferrer" title={`在浏览器打开 localhost:${port}`}>:{port}</a>)}</div>}
-              <div className="container-actions"><button disabled={locked(container.name)} className="mini-button" onClick={()=>act(`${container.running?'停止':'启动'} ${container.name}`,`/api/containers/${encodeURIComponent(container.name)}/${container.running?'stop':'start'}`)}>{container.running?'停止':'启动'}</button>{container.running&&<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>act(`重启 ${container.name}`,`/api/containers/${encodeURIComponent(container.name)}/restart`,{},container.name)}>重启</button>}<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>showLogs(container.name)}>日志</button>{container.running&&<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>setExecView({name:container.name,cmd:'',output:''})}>命令</button>}</div></article>;
+              return <article className="container-card" key={container.id}><div className="container-top"><span className="container-logo">{container.name.slice(0,1).toUpperCase()}</span><span className="container-id">{container.id.slice(0,8)}</span></div><div><span className="group-label">{container.project||'独立容器'}</span><h3><button className="name-link" title="查看详情" onClick={()=>openDetail(container.name)}>{container.name}</button></h3><p title={container.image}>{container.image}</p></div><div className="container-meta"><span className={container.running?'state running':'state stopped'}><i/>{container.running?'运行中':'已停止'}</span><span className="container-status" title={container.status}>{container.status||container.state}</span></div>{ports.length>0&&<div className="port-row">{ports.map(port=><a className="port-chip" key={port} href={`http://localhost:${port}`} target="_blank" rel="noreferrer" title={`在浏览器打开 localhost:${port}`}>:{port}</a>)}</div>}
+              <div className="container-actions"><button disabled={locked(container.name)} className="mini-button" onClick={()=>act(`${container.running?'停止':'启动'} ${container.name}`,`/api/containers/${encodeURIComponent(container.name)}/${container.running?'stop':'start'}`)}>{container.running?'停止':'启动'}</button>{container.running&&<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>act(`重启 ${container.name}`,`/api/containers/${encodeURIComponent(container.name)}/restart`,{},container.name)}>重启</button>}<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>showLogs(container.name)}>日志</button>{container.running&&<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>setExecView({name:container.name,cmd:'',output:''})}>命令</button>}{!container.running&&<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>removeContainer(container.name)}>删除</button>}</div></article>;
             })}
             {dockerOn&&!loading&&visibleContainers.length===0&&<div className="empty-state">没有匹配的容器</div>}{!dockerOn&&!loading&&<div className="empty-state">Docker 当前未运行，启动后即可管理容器。</div>}
           </div>
@@ -337,11 +368,11 @@ export default function Dashboard() {
               {!loading&&visibleContainers.map(container=>{
                 const ports=hostPorts(container.ports);
                 return <tr key={container.id}>
-                  <td><span className="c-name"><span className="container-logo sm">{container.name.slice(0,1).toUpperCase()}</span><span className="c-name-text"><strong>{container.name}</strong><small>{container.project||'独立容器'}</small></span></span></td>
+                  <td><span className="c-name"><span className="container-logo sm">{container.name.slice(0,1).toUpperCase()}</span><span className="c-name-text"><button className="name-link" onClick={()=>openDetail(container.name)}><strong>{container.name}</strong></button><small>{container.project||'独立容器'}</small></span></span></td>
                   <td className="c-image" title={container.image}>{container.image}</td>
                   <td><span className={container.running?'state running':'state stopped'}><i/>{container.running?'运行中':'已停止'}</span><span className="c-status">{container.status}</span></td>
                   <td>{ports.length>0?<span className="port-row">{ports.map(port=><a className="port-chip" key={port} href={`http://localhost:${port}`} target="_blank" rel="noreferrer" title={`打开 localhost:${port}`}>:{port}</a>)}</span>:<span className="f-size">—</span>}</td>
-                  <td><span className="f-actions"><button disabled={locked(container.name)} className="mini-button" onClick={()=>act(`${container.running?'停止':'启动'} ${container.name}`,`/api/containers/${encodeURIComponent(container.name)}/${container.running?'stop':'start'}`)}>{container.running?'停止':'启动'}</button>{container.running&&<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>act(`重启 ${container.name}`,`/api/containers/${encodeURIComponent(container.name)}/restart`,{},container.name)}>重启</button>}<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>showLogs(container.name)}>日志</button></span></td>
+                  <td><span className="f-actions"><button disabled={locked(container.name)} className="mini-button" onClick={()=>act(`${container.running?'停止':'启动'} ${container.name}`,`/api/containers/${encodeURIComponent(container.name)}/${container.running?'stop':'start'}`)}>{container.running?'停止':'启动'}</button>{container.running&&<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>act(`重启 ${container.name}`,`/api/containers/${encodeURIComponent(container.name)}/restart`,{},container.name)}>重启</button>}<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>showLogs(container.name)}>日志</button><button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>openDetail(container.name)}>详情</button>{!container.running&&<button disabled={locked(container.name)} className="mini-button ghost" onClick={()=>removeContainer(container.name)}>删除</button>}</span></td>
                 </tr>;})}
               {!loading&&dockerOn&&visibleContainers.length===0&&<tr><td colSpan={5} className="f-none">没有匹配的容器</td></tr>}
               {!loading&&!dockerOn&&<tr><td colSpan={5} className="f-none">Docker 当前未运行，到「总览」启动后即可管理容器。</td></tr>}
@@ -356,6 +387,23 @@ export default function Dashboard() {
         </section></div>
       </div>
     </section>
+
+    {detailView&&<div className="modal-backdrop" role="presentation" onMouseDown={()=>setDetailView(null)}><section className="log-modal" role="dialog" aria-modal="true" aria-label={`${detailView} 详情`} onMouseDown={event=>event.stopPropagation()}>
+      <header><div><small>容器详情 · Esc 关闭</small><h2>{detailView}</h2></div>
+        <div className="log-tools"><button onClick={()=>openDetail(detailView)} title="刷新">↻</button><button onClick={()=>setDetailView(null)} aria-label="关闭">×</button></div></header>
+      <div className="detail-body">
+        {!detailData?<div className="detail-loading">读取中…</div>:<>
+          <div className="detail-grid2">
+            <div><small>镜像</small><strong className="mono-name">{String(detailData.image||'—')}</strong></div>
+            <div><small>状态</small><strong>{String(detailData.status||'—')} · 重启 {String(detailData.restartCount??0)} 次 · 策略 {String(detailData.restartPolicy)}</strong></div>
+            <div><small>网络</small><strong>{Array.isArray(detailData.networks)&&detailData.networks.length?detailData.networks.join(', '):'—'}</strong></div>
+          </div>
+          <div className="detail-sec"><small>端口映射</small><pre>{Array.isArray(detailData.ports)&&detailData.ports.length?detailData.ports.join('\n'):'（无）'}</pre></div>
+          <div className="detail-sec"><small>挂载</small><pre>{Array.isArray(detailData.mounts)&&detailData.mounts.length?detailData.mounts.join('\n'):'（无）'}</pre></div>
+          <div className="detail-sec"><small>环境变量（最多 40 项）</small><pre>{Array.isArray(detailData.env)?detailData.env.join('\n'):'—'}</pre></div>
+        </>}
+      </div>
+    </section></div>}
 
     {execView&&<div className="modal-backdrop" role="presentation" onMouseDown={()=>setExecView(null)}><section className="log-modal" role="dialog" aria-modal="true" aria-label={`${execView.name} 命令执行`} onMouseDown={event=>event.stopPropagation()}>
       <header><div><small>容器内命令（实验性 · 每次单独执行）</small><h2>{execView.name}</h2></div>
