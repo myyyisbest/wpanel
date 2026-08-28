@@ -105,6 +105,18 @@ export default function ComposePage({ token, notify, containers }:{ token:string
     finally { setBusy('');setBusyKey(''); }
   }
 
+  async function removeProject(project:Project) {
+    if (!window.confirm(`删除项目 ${project.name}？将停止其容器并删除整个项目文件夹（含 compose 文件）；数据卷默认保留。`)) return;
+    setBusy('删除项目');setBusyKey(project.name);
+    try {
+      const response = await fetch(`${__WPANEL_API__}/api/compose/delete`,{method:'POST',headers:{'Content-Type':'application/json','X-WPanel-Token':token},body:JSON.stringify({project:project.name})});
+      const result = await response.json() as {error?:string};
+      if (!response.ok) throw new Error(result.error || '删除失败');
+      notify('ok',`项目 ${project.name} 已删除`);await load();
+    } catch (reason) { notify('err',reason instanceof Error?reason.message:'删除失败'); }
+    finally { setBusy('');setBusyKey(''); }
+  }
+
   if (!token) return <section className="file-wrap"><div className="empty-state">控制会话尚未就绪，稍候自动重试。</div></section>;
 
   const stats = (name:string) => {
@@ -130,6 +142,7 @@ export default function ComposePage({ token, notify, containers }:{ token:string
               <button className="mini-button ghost" disabled={locked(project.name)} onClick={()=>{if(window.confirm(`停止并移除 ${project.name} 的容器？卷数据默认保留。`))act(`停止 ${project.name}`,project.name,'/api/compose/down',{})}}>停止</button>
               <button className="mini-button ghost" disabled={locked(project.name)} onClick={()=>openEditor(project)}>编辑</button>
               <button className="mini-button ghost" disabled={locked(project.name)} onClick={()=>showLogs(project.name)}>日志</button>
+              <button className="mini-button ghost" disabled={locked(project.name)} onClick={()=>removeProject(project)}>删除</button>
             </span></td>
           </tr>;
         })}

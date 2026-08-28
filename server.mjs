@@ -685,11 +685,17 @@ async function handleAction(pathname, body) {
     return addActivity('prune', '未使用卷', true, result.stdout || '清理完成');
   }
 
-  const composeMatch = pathname.match(/^\/api\/compose\/(up|down)$/);
+  const composeMatch = pathname.match(/^\/api\/compose\/(up|down|delete)$/);
   if (composeMatch) {
     const action = composeMatch[1];
     const project = typeof body.project === 'string' ? body.project : '';
-    await composeProjectUnc(project);
+    const unc = await composeProjectUnc(project, true);
+    if (action === 'delete') {
+      // 先尝试停止容器（未部署过的项目 down 只会警告，忽略其结果）；数据卷默认保留
+      try { await runCompose(project, `down${body.removeVolumes ? ' -v' : ''}`); } catch { /* 项目从未部署时继续删除文件夹 */ }
+      await rm(unc, { recursive: true, force: true });
+      return addActivity('delete', `compose ${project}`, true, '项目已删除（compose 文件与文件夹）');
+    }
     const result = await runCompose(project, action === 'up' ? 'up -d' : `down${body.removeVolumes ? ' -v' : ''}`);
     return addActivity(action, `compose ${project}`, true, result.stdout.slice(-500) || '操作完成');
   }
