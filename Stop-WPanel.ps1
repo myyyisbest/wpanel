@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $RootPattern = [regex]::Escape($PSScriptRoot)
 $stopped = [System.Collections.Generic.List[int]]::new()
 
