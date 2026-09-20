@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 type Entry = { name:string;type:'dir'|'file'|'link';linkDir?:boolean;size:number|null;mtime:number|null };
-type ListData = { path:string;roots:string[];entries:Entry[] };
+type ListData = { path:string;roots:string[];entries:Entry[];total?:number;truncated?:boolean };
 
 const API = __WPANEL_API__;
 const IMG_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
@@ -224,6 +224,7 @@ export default function FileManager({ token, ubuntuOn, notify }:{ token:string;u
           </tr>;
         })}
         {entries.length===0&&<tr><td colSpan={4} className="f-none">{filter?'没有匹配的文件':'此目录为空'}</td></tr>}
+        {data.truncated&&<tr><td colSpan={4} className="f-none">该目录共 {data.total} 项，仅列出前 {data.entries.length} 项；请用「过滤当前目录」缩小范围，或在 WSL 内直接操作</td></tr>}
       </tbody>
     </table></div>}
 
