@@ -245,7 +245,7 @@ node -v      # 应输出 v22.13.0 或更高
 npm -v
 ```
 
-启动脚本使用 PowerShell 7，若尚未安装：
+启动脚本**无需额外安装 PowerShell**：四个 `.bat` 会优先调用 PowerShell 7（`pwsh.exe`），找不到时自动回退到 Windows 自带的 PowerShell 5.1（`powershell.exe`）。若你偏好 PowerShell 7：
 
 ```powershell
 winget install Microsoft.PowerShell
@@ -292,7 +292,7 @@ npm run build
 | 发行版名不是 `Ubuntu` | 设置 `WPANEL_DISTRO` 环境变量，或在 `启动WPanel.bat` 之前 `set WPANEL_DISTRO=Ubuntu-24.04` |
 | 文件管理里 `/home` 打不开或权限不足 | 确认发行版已启动；WPanel 以发行版**默认用户**身份访问文件共享，`/root`、`/etc` 等 root 属地不可操作 |
 | 提示「端口 8766 已被占用」 | 关闭占用进程，或设置 `WPANEL_PORT` 换端口（同时需用 `NEXT_PUBLIC_WPANEL_API` 重新构建前端） |
-| `启动WPanel.bat` 报找不到 pwsh | 安装 PowerShell 7：`winget install Microsoft.PowerShell` |
+| `启动WPanel.bat` 报找不到 PowerShell | `pwsh.exe` 与 `powershell.exe` 都不在 PATH。后者随系统自带（位于 `%SystemRoot%\System32\WindowsPowerShell\v1.0\`），请检查 PATH 是否被裁剪 |
 | 提示「依赖尚未安装 / 生产版本尚未构建」 | 依次执行 `npm install` 与 `npm run build` |
 
 ---
