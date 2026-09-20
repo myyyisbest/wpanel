@@ -309,7 +309,13 @@ Ubuntu / Docker 运行状态、内存与 CPU（最近 5 分钟本机采样趋势
 
 卡片 / 列表双视图，支持按名称搜索。每个容器提供启动、停止、重启、查看日志、删除；运行中的容器可进入**命令盒**（实验性，见[安全模型](#安全模型)）。端口徽章可直接跳到 `localhost:<端口>`。带 `com.docker.compose.project` 标签的容器会自动按 Compose 项目分组展示。
 
+卡片视图（状态与端口一目了然）：
+
 ![容器卡片视图](docs/screenshots/containers-cards-light.png)
+
+列表视图（信息密度更高，容器较多时便于扫视）：
+
+![容器列表视图](docs/screenshots/containers-list-light.png)
 
 ### 实时日志
 
@@ -363,11 +369,31 @@ SSE 流式跟随 `docker logs -f`，可在 100 / 250 / 1000 行之间切换，�
 
 ### 主题
 
-深色 / 浅色 / 跟随系统三态，选择记忆在浏览器本地。
+深色 / 浅色 / 跟随系统三态，选择记忆在浏览器本地。前面各节都是浅色截图，这里是同一套界面在深色下的表现：
 
-| 深色 | 浅色 |
+| 总览 | 容器（卡片） |
 |---|---|
-| ![总览-深色](docs/screenshots/overview-dark.png) | ![容器-浅色](docs/screenshots/containers-cards-light.png) |
+| ![总览-深色](docs/screenshots/overview-dark.png) | ![容器卡片-深色](docs/screenshots/containers-cards-dark.png) |
+
+| 容器（列表） | 实时日志 |
+|---|---|
+| ![容器列表-深色](docs/screenshots/containers-list-dark.png) | ![容器日志-深色](docs/screenshots/container-logs-dark.png) |
+
+| 镜像与卷 | Compose 编排 |
+|---|---|
+| ![镜像与卷-深色](docs/screenshots/images-volumes-dark.png) | ![Compose 编排-深色](docs/screenshots/compose-dark.png) |
+
+| 应用商店 | 安装预览 |
+|---|---|
+| ![应用商店-深色](docs/screenshots/store-dark.png) | ![安装预览-深色](docs/screenshots/store-install-dark.png) |
+
+| 文件管理 | AI 助手 |
+|---|---|
+| ![文件管理-深色](docs/screenshots/files-dark.png) | ![AI 助手-深色](docs/screenshots/ai-dark.png) |
+
+| 日志记录 | |
+|---|---|
+| ![日志记录-深色](docs/screenshots/activity-dark.png) | |
 
 ---
 
