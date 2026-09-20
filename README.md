@@ -43,7 +43,7 @@
 ## 快速开始
 
 ```powershell
-git clone https://github.com/<you>/wpanel.git
+git clone https://github.com/myyyisbest/wpanel.git
 cd wpanel
 npm install
 npm run build
@@ -81,8 +81,9 @@ npm run build
 ```bash
 npm run dev         # 前端开发模式
 npm run controller  # 单独启动控制服务（WPANEL_PORT 可覆盖端口）
-npm run build       # 生产构建
+npm run build       # 生产构建（vinext / Vite）
 npm run lint        # ESLint
+npm run typecheck   # tsc --noEmit（build 不做类型检查，这条单独兜住类型回归）
 ```
 
 ## 致谢

@@ -16,4 +16,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
+      # build 走的是 vinext（Vite），不做类型检查；tsc 单独跑一遍兜住类型回归
+      - run: npm run typecheck
       - run: npm run build
