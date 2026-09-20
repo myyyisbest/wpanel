@@ -604,10 +604,17 @@ function pruneInstallJobs() {
 }
 
 function safeStorePath(...segments) {
-  const resolved = path.resolve(STORE_DIR, ...segments);
-  if (!resolved.startsWith(path.resolve(STORE_DIR))) throw new Error('路径无效');
+  const root = path.resolve(STORE_DIR);
+  const resolved = path.resolve(root, ...segments);
+  // 必须等于根本身，或落在「根 + 分隔符」之下。
+  // 只比较裸前缀会漏掉兄弟目录：STORE_DIR=/tmp/store 时 /tmp/store-evil 也能通过。
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) throw new Error('路径无效');
   return resolved;
 }
+
+// 商店模板来自第三方：外部链接只放行 http/https。
+// 否则模板里写 javascript: 之类的伪协议会被前端渲染成可点链接，点击即在面板源下执行脚本。
+const httpUrl = (value) => (/^https?:\/\//i.test(String(value || '')) ? String(value) : '');
 
 async function storeAppMeta(id) {
   const file = safeStorePath('apps', id, 'data.yml');
@@ -620,9 +627,9 @@ async function storeAppMeta(id) {
     description: meta.description || props.shortDescZh || '',
     tags: props.tags || meta.tags || [],
     type: props.type || '',
-    website: props.website || '',
-    github: props.github || '',
-    document: props.document || '',
+    website: httpUrl(props.website),
+    github: httpUrl(props.github),
+    document: httpUrl(props.document),
   };
 }
 
@@ -913,10 +920,19 @@ async function handleAction(pathname, body) {
 
 const server = http.createServer(async (request, response) => {
   const origin = request.headers.origin;
-  const url = new URL(request.url || '/', `http://${request.headers.host || `${HOST}:${PORT}`}`);
 
-  // Host 校验：只接受本机地址，挡住「恶意域名解析到 127.0.0.1」的 DNS rebinding 读取
+  // Host 校验必须排在 URL 解析之前：解析 URL 要用 Host 头作为 base，
+  // 先解析等于信任了尚未校验的输入；而且非法 Host 会让 new URL 抛错，
+  // 此时还没进入下面的 try，响应将永远不返回（客户端只能等超时）。
+  // 同时挡住「恶意域名解析到 127.0.0.1」的 DNS rebinding 读取。
   if (!allowedHosts.has(request.headers.host || '')) return send(response, 403, { error: 'Host 不受信任' }, origin);
+
+  let url;
+  try {
+    url = new URL(request.url || '/', `http://${request.headers.host}`);
+  } catch {
+    return send(response, 400, { error: '请求地址无效' }, origin);
+  }
 
   if (request.method === 'OPTIONS') {
     if (!origin || !allowedOrigins.has(origin)) return send(response, 403, { error: '来源不受信任' }, origin);
