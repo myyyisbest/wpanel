@@ -106,7 +106,10 @@ export default function AiPage({ token, notify, containers, onChanged }:{ token:
         const result = await response.json() as {error?:string};
         if (!response.ok) throw new Error(result.error || '保存失败');
       };
-      await call('mkdir',{path:`${composeDir}/${name}`});
+      // 同名项目已存在时直接覆盖 compose 文件，不再因为目录已存在而整段失败
+      await call('mkdir',{path:`${composeDir}/${name}`}).catch((reason:unknown) => {
+        if (!(reason instanceof Error) || !reason.message.includes('已存在')) throw reason;
+      });
       await call('save',{path:`${composeDir}/${name}/compose.yaml`,content:composeYaml});
       notify('ok',`已保存到编排目录「${name}」`);
     } catch (reason) { notify('err',reason instanceof Error?reason.message:'保存失败'); }
