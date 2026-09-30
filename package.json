@@ -11,26 +11,32 @@
     "build": "vinext build",
     "start": "vinext start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "app": "electron .",
+    "app:dist": "electron-builder --win portable --config electron-builder.yml"
   },
   "dependencies": {
     "next": "16.2.6",
     "react": "19.2.6",
     "react-dom": "19.2.6",
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "vinext": "1.0.0-beta.3",
+    "react-server-dom-webpack": "19.2.6",
+    "vite": "8.0.13",
+    "@vitejs/plugin-rsc": "0.5.26"
   },
   "devDependencies": {
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
-    "@vitejs/plugin-rsc": "0.5.26",
+    "electron": "^44.5.0",
+    "electron-builder": "^26.15.3",
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.6",
-    "react-server-dom-webpack": "19.2.6",
-    "typescript": "5.9.3",
-    "vinext": "1.0.0-beta.3",
-    "vite": "8.0.13"
+    "typescript": "5.9.3"
   },
-  "type": "module"
+  "type": "module",
+  "main": "electron/main.cjs",
+  "description": "WSL2 与 Docker 的本机驾驶舱"
 }

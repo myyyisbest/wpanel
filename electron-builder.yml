@@ -1,0 +1,37 @@
+appId: io.github.myyyisbest.wpanel
+productName: WPanel
+copyright: WPanel Contributors
+
+directories:
+  output: release2
+  buildResources: build
+
+files:
+  - electron/**/*
+  - server.mjs
+  - package.json
+  - build/icon.png
+  - dist/**/*
+  - node_modules/**/*
+  - "!node_modules/**/.cache{,/**}"
+  - "!node_modules/**/{test,__tests__,tests,example,examples}{,/**}"
+  - "!node_modules/**/*.{md,markdown}"
+  - "!node_modules/**/{.github,.vscode,.idea}{,/**}"
+  - "!node_modules/electron{,/**}"
+  - "!node_modules/electron-builder{,/**}"
+
+# next/vinext 需要真实文件系统（asar 内无法运行），关闭 asar
+asar: false
+compression: maximum
+
+win:
+  icon: build/icon.png
+  target:
+    - target: portable
+      arch: [x64]
+
+portable:
+  artifactName: WPanel-Portable-${version}.exe
+
+# 本应用是后台服务型工具：不强制要求代码签名
+forceCodeSigning: false

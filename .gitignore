@@ -23,3 +23,8 @@ tsconfig.tsbuildinfo
 
 # security hook local state
 .mimosa/
+
+# electron build output
+release/
+release2/
+release.*

@@ -397,6 +397,20 @@ SSE 流式跟随 `docker logs -f`，可在 100 / 250 / 1000 行之间切换，�
 
 ---
 
+## 桌面应用（可选）
+
+不想装 Node.js？可以打包成便携版 exe：
+
+```powershell
+npm install
+npm run build
+npm run app:dist     # 产出 release2\WPanel-Portable-*.exe（约 136MB）
+```
+
+双击即用：窗口 ✕ 收进系统托盘，托盘菜单可勾选开机自启，「退出」会同时停止面板的两个后台服务。打包版的数据目录自动落在 `%APPDATA%\WPanel`（浏览器模式下仍是项目目录的 `data/`）。
+
+---
+
 ## 安全模型
 
 WPanel 是一个**本机工具**，设计目标是「不把本机 Docker 的 root 权限暴露到网络上」。具体措施：

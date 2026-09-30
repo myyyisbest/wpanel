@@ -15,7 +15,7 @@ const HOST = '127.0.0.1';
 const PORT = Number(process.env.WPANEL_PORT) || 8766;
 const DISTRO = process.env.WPANEL_DISTRO || 'Ubuntu';
 const TOKEN = randomBytes(24).toString('hex');
-const DATA_DIR = path.join(process.cwd(), 'data');
+const DATA_DIR = process.env.WPANEL_DATA_DIR || path.join(process.cwd(), 'data');
 const ACTIVITY_FILE = path.join(DATA_DIR, 'activity.jsonl');
 const LOCAL_CONFIG_FILE = path.join(DATA_DIR, 'wpanel.local.json');
 
