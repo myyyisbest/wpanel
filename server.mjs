@@ -2,8 +2,8 @@ import http from 'node:http';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { appendFile, mkdir, readFile, readdir, rename, rm, stat, realpath, access, writeFile } from 'node:fs/promises';
-import { existsSync, readFileSync, readdirSync, createReadStream, createWriteStream } from 'node:fs';
+import { appendFile, mkdir, open, readFile, readdir, rename, rm, stat, realpath, access, writeFile } from 'node:fs/promises';
+import { existsSync, readFileSync, statSync, createReadStream, createWriteStream } from 'node:fs';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
@@ -18,23 +18,67 @@ const TOKEN = randomBytes(24).toString('hex');
 const DATA_DIR = path.join(process.cwd(), 'data');
 const ACTIVITY_FILE = path.join(DATA_DIR, 'activity.jsonl');
 const LOCAL_CONFIG_FILE = path.join(DATA_DIR, 'wpanel.local.json');
-const allowedOrigins = new Set(['http://localhost:8765', 'http://127.0.0.1:8765']);
 
-// 服务列表默认仅 docker；本机扩展项写在 data/wpanel.local.json（不进 git）：
-// { "services": [{ "key": "postgresql", "name": "PostgreSQL", "unit": "postgresql.service" }] }
-function readServicesConfig() {
+// 前端来源白名单：默认放行本机 8765（UI 端口），可用 WPANEL_UI_ORIGINS 覆盖（逗号分隔）
+const allowedOrigins = new Set(
+  (process.env.WPANEL_UI_ORIGINS || 'http://localhost:8765,http://127.0.0.1:8765')
+    .split(',').map((item) => item.trim()).filter(Boolean),
+);
+// Host 白名单：浏览器访问本机服务必然带 Host，DNS rebinding 会带上攻击者域名，这里直接拒绝
+const allowedHosts = new Set(
+  (process.env.WPANEL_ALLOWED_HOSTS || `127.0.0.1:${PORT},localhost:${PORT}`)
+    .split(',').map((item) => item.trim()).filter(Boolean),
+);
+
+// data/*.json 读取缓存（按 mtime 失效）：配置读取在请求热路径上，避免每次都落盘
+const jsonCache = new Map();
+function readJsonCached(file) {
   try {
-    const parsed = JSON.parse(readFileSync(LOCAL_CONFIG_FILE, 'utf8'));
-    const list = Array.isArray(parsed.services) ? parsed.services : [];
-    return list.filter((item) => item && typeof item.key === 'string' && typeof item.unit === 'string' && /^[a-z0-9-]{1,64}$/.test(item.key))
-      .map((item) => ({ key: item.key, name: String(item.name || item.key).slice(0, 64), unit: item.unit }));
+    const info = statSync(file);
+    const cached = jsonCache.get(file);
+    if (cached && cached.mtimeMs === info.mtimeMs) return cached.value;
+    const value = JSON.parse(readFileSync(file, 'utf8'));
+    jsonCache.set(file, { mtimeMs: info.mtimeMs, value });
+    return value;
   } catch {
-    return [];
+    jsonCache.delete(file);
+    return null;
   }
 }
 
+// 写入 data/*.json：mtime 精度可能只有秒级，写入后主动失效缓存
+async function writeJsonConfig(file, value) {
+  await mkdir(DATA_DIR, { recursive: true });
+  await writeFile(file, JSON.stringify(value, null, 2), 'utf8');
+  jsonCache.delete(file);
+}
+
+// 服务列表默认仅 docker；本机扩展项写在 data/wpanel.local.json（不进 git）：
+// { "services": [{ "key": "postgresql", "name": "PostgreSQL", "unit": "postgresql.service" }] }
+// key 与 unit 都做严格校验：unit 最终会进 systemctl 参数，不接受任何多余字符
+function readServicesConfig() {
+  const parsed = readJsonCached(LOCAL_CONFIG_FILE);
+  const list = Array.isArray(parsed?.services) ? parsed.services : [];
+  return list.filter((item) => item && typeof item.key === 'string' && typeof item.unit === 'string'
+    && /^[a-z0-9-]{1,64}$/.test(item.key) && /^[A-Za-z0-9@._-]{1,64}\.service$/.test(item.unit))
+    .map((item) => ({ key: item.key, name: String(item.name || item.key).slice(0, 64), unit: item.unit }));
+}
+
+// 关闭 WSL / 停止 Docker 时一并停止的单元：内置 Docker 三件套 + 配置的服务 + WPANEL_STOP_UNITS
+const DOCKER_UNITS = ['docker.service', 'docker.socket', 'containerd.service'];
+const EXTRA_STOP_UNITS = (process.env.WPANEL_STOP_UNITS || '')
+  .split(',').map((item) => item.trim()).filter((item) => /^[a-z0-9@._-]{1,64}\.service$/.test(item));
+const dockerStopUnits = () => [...new Set([...DOCKER_UNITS, ...EXTRA_STOP_UNITS])];
+const shutdownStopUnits = () => [...new Set([...dockerStopUnits(), ...readServicesConfig().map((item) => item.unit)])];
+
+// 归一化允许根：去尾部斜杠、只保留绝对路径
+// （相对路径或带尾斜杠的写法永远不会匹配成功，容易让人误以为配置已生效）
 const FILE_ROOTS = (process.env.WPANEL_ROOTS || '/home')
-  .split(',').map((item) => item.trim()).filter(Boolean);
+  .split(',').map((item) => item.trim().replace(/\/+$/, '')).filter((item) => item.startsWith('/'));
+if (!FILE_ROOTS.length) {
+  console.warn('WPANEL_ROOTS 中没有合法的绝对路径，已回退为 /home');
+  FILE_ROOTS.push('/home');
+}
 const EDIT_MAX_BYTES = 1024 * 1024;
 const UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
 const LIST_MAX_ENTRIES = 500;
@@ -63,24 +107,48 @@ function assertAllowedPath(path) {
   }
 }
 
-// follow=false 用于删除/改名：符号链接本身操作不会跟随目标
-async function checkedUnc(path, follow = true) {
-  assertAllowedPath(path);
+// 允许根校验 + UNC 组装。follow=false 用于删除/改名（只操作链接本身，不跟随目标）。
+//
+// 路径防护分两层，二者都不是唯一依赖：
+//   1) assertAllowedPath —— 词法层：按字符串前缀判断，拒绝 `..`（由 normalizeLinuxPath 前置拦截）；
+//   2) assertRealWithinRoot —— 规范化层：用 realpath 解析父目录（follow 时连目标一起解析），
+//      再对解析结果做一次白名单判断。
+// 第 2 层用于兜住第 1 层看不见的符号链接跳转，例如 /home/dev/current/xxx
+// （current 是指向 /etc 的符号链接）这类路径。
+//
+// 实测补充（Windows + WSL 9p 共享）：当前平台**无法跟随 Linux 符号链接**——
+// 对 /bin、/lib、/etc/os-release 这类链接，lstat 报 EISDIR，realpath / readdir / readFile 一律报 ENOENT；
+// 而同一目标的真实路径（如 /usr/bin/bash）读写正常。因此经符号链接的访问会被底层直接拒绝（fail-closed），
+// 第 2 层在此平台属于纵深防御：一旦平台日后支持跟随链接，它会立刻成为有效的拦截点。
+async function checkedUnc(target, follow = true) {
+  assertAllowedPath(target);
   const base = await resolveUncBase();
-  const unc = base + path.replaceAll('/', '\\');
-  if (follow) {
-    try {
-      const real = await realpath(unc);
-      if (real.startsWith(base)) {
-        const realPath = real.slice(base.length).replaceAll('\\', '/');
-        assertAllowedPath(realPath);
-      }
-    } catch (error) {
-      if (error.message.startsWith('路径超出允许范围')) throw error;
-      // ENOENT 等留给调用方按实际操作报错
-    }
-  }
+  const unc = base + target.replaceAll('/', '\\');
+  const parent = target.slice(0, target.lastIndexOf('/')) || '/';
+  await assertRealWithinRoot(base, parent);
+  if (follow) await assertRealWithinRoot(base, target);
   return unc;
+}
+
+async function assertRealWithinRoot(base, linuxPath) {
+  let real;
+  try {
+    real = await realpath(base + linuxPath.replaceAll('/', '\\'));
+  } catch {
+    // ENOENT / EISDIR 等：目标不存在，或目标本身是 Linux 符号链接（本平台无法解析）。
+    // 两种情况都留给调用方按实际操作报错，从而保持 fail-closed —— 不会因「解析不出来」而放行。
+    return;
+  }
+  // 前缀比较不区分大小写：发行版名在不同入口可能大小写不一致，
+  // 否则会把正常路径误判成越界，直接让文件管理不可用。
+  if (!real.toLowerCase().startsWith(base.toLowerCase())) {
+    // realpath 成功却落在共享之外 —— 只可能是异常跳转，按越界处理（保守拒绝）
+    throw new Error('路径超出允许范围（解析结果不在 WSL 共享内）');
+  }
+  // 共享根本身会解析成 base + '\'，相对路径为空 —— 此时无需再做白名单判断
+  const relative = real.slice(base.length).replaceAll('\\', '/').replace(/\/+$/, '');
+  if (!relative) return;
+  assertAllowedPath(relative);
 }
 
 function validFileName(name) {
@@ -90,7 +158,8 @@ function validFileName(name) {
 async function listDir(path) {
   const unc = await checkedUnc(path);
   const dirents = await readdir(unc, { withFileTypes: true });
-  const entries = await Promise.all(dirents.slice(0, LIST_MAX_ENTRIES).map(async (dirent) => {
+  const visible = dirents.slice(0, LIST_MAX_ENTRIES);
+  const entries = await Promise.all(visible.map(async (dirent) => {
     const type = dirent.isDirectory() ? 'dir' : dirent.isSymbolicLink() ? 'link' : 'file';
     let size = null;
     let mtime = null;
@@ -104,7 +173,8 @@ async function listDir(path) {
     return { name: dirent.name, type, linkDir, size, mtime };
   }));
   entries.sort((a, b) => ((a.type === 'dir' || a.linkDir) ? 0 : 1) - ((b.type === 'dir' || b.linkDir) ? 0 : 1) || a.name.localeCompare(b.name, 'zh-CN'));
-  return entries;
+  // 截断要显式告知前端，避免用户以为「目录里就这些」
+  return { entries, total: dirents.length, truncated: dirents.length > visible.length };
 }
 
 async function readTextFile(path) {
@@ -145,6 +215,15 @@ async function run(file, args, options = {}) {
   }
 }
 
+// 跟踪子进程：收到退出信号时一并回收，避免残留 wsl.exe 与 docker 进程
+const children = new Set();
+function trackChild(child) {
+  children.add(child);
+  child.on('close', () => children.delete(child));
+  child.on('error', () => children.delete(child));
+  return child;
+}
+
 const wsl = (...args) => run('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', ...args]);
 const docker = (...args) => wsl('docker', ...args);
 
@@ -171,16 +250,20 @@ function validContainerName(name) {
 }
 
 // 一次 bash 采样取齐：IP、内存、CPU、uptime、磁盘、配置的服务状态
+// 单元名以位置参数传入（不拼进脚本正文），因此配置里写什么都无法注入 shell；
+// 脚本内先 units=("$@") 存一份，因为后面的 set -- 会覆盖位置参数
 function statusSnapshotCommand() {
-  const unitList = ['docker.service', ...readServicesConfig().map((item) => item.unit)];
-  return "ip=$(hostname -I 2>/dev/null | awk '{print $1}'); "
+  const units = ['docker.service', ...readServicesConfig().map((item) => item.unit)];
+  const script = 'units=("$@"); '
+    + "ip=$(hostname -I 2>/dev/null | awk '{print $1}'); "
     + "total=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo); "
     + "avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo); "
     + "cpu=$(LC_ALL=C top -bn1 | awk '/Cpu\\(s\\)/{print 100-$8; exit}'); "
     + "up=$(awk '{print int($1)}' /proc/uptime); "
-    + "set -- $(df -k / | tail -1); "
-    + `sv=$(systemctl is-active ${unitList.join(' ')} 2>/dev/null | tr '\\n' ','); `
+    + 'set -- $(df -k / | tail -1); '
+    + 'sv=$(systemctl is-active "${units[@]}" 2>/dev/null | tr \'\\n\' \',\'); '
     + 'printf \'%s|%s|%s|%s|%s|%s|%s|%s\' "$ip" "$total" "$avail" "$cpu" "$up" "$2" "$3" "$sv"';
+  return { script, units };
 }
 
 async function getStatus() {
@@ -197,10 +280,12 @@ async function getStatus() {
 
   if (!ubuntuRunning) return base;
 
+  // 单元名以位置参数传入：$0 占位后依次是各单元，脚本内不再拼接任何配置内容
+  const statusCmd = statusSnapshotCommand();
   const [systemd, dockerActive, systemInfo] = await Promise.all([
     wsl('systemctl', 'is-system-running'),
     wsl('systemctl', 'is-active', 'docker.service'),
-    wsl('bash', '-lc', statusSnapshotCommand()),
+    wsl('bash', '-lc', statusCmd.script, 'wpanel-status', ...statusCmd.units),
   ]);
 
   base.ubuntu.systemd = systemd.ok && ['running', 'degraded'].includes(systemd.stdout);
@@ -267,20 +352,50 @@ async function getStatus() {
   return base;
 }
 
+const ACTIVITY_MAX_BYTES = 5 * 1024 * 1024;
+const ACTIVITY_TAIL_BYTES = 2 * 1024 * 1024;
+
 async function addActivity(action, target, success, message) {
   await mkdir(DATA_DIR, { recursive: true });
   const entry = { at: new Date().toISOString(), action, target, success, message: String(message || '').slice(0, 500) };
-  await appendFile(ACTIVITY_FILE, `${JSON.stringify(entry)}\n`, 'utf8');
+  const line = `${JSON.stringify(entry)}\n`;
+  // 轮转：文件超过上限时保留上一份，避免长期运行后无限增长
+  try {
+    const info = await stat(ACTIVITY_FILE);
+    if (info.size + Buffer.byteLength(line) > ACTIVITY_MAX_BYTES) {
+      await rename(ACTIVITY_FILE, `${ACTIVITY_FILE}.1`).catch(() => {});
+    }
+  } catch { /* 文件尚不存在 */ }
+  await appendFile(ACTIVITY_FILE, line, 'utf8');
   return entry;
 }
 
-// 审计日志读取：服务端关键字过滤 + 分页（最多回溯 5000 条，防止文件过大拖垮内存）
-async function readActivity({ search = '', page = 1, pageSize = 30 } = {}) {
-  let entries = [];
+// 只读取文件尾部窗口，避免日志增长后整文件读入内存
+async function readTailText(file, maxBytes) {
+  let handle;
   try {
-    const lines = (await readFile(ACTIVITY_FILE, 'utf8')).split('\n').filter(Boolean).slice(-5000);
-    entries = lines.map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean).reverse();
-  } catch { entries = []; }
+    handle = await open(file, 'r');
+    const info = await handle.stat();
+    const length = Math.min(info.size, maxBytes);
+    const start = info.size - length;
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, start);
+    const text = buffer.toString('utf8');
+    // 起点可能落在某行中间，丢弃首行残片
+    return start > 0 ? text.slice(text.indexOf('\n') + 1) : text;
+  } catch {
+    return '';
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+// 审计日志读取：服务端关键字过滤 + 分页（只回读文件尾部窗口，防止文件过大拖垮内存）
+async function readActivity({ search = '', page = 1, pageSize = 30 } = {}) {
+  const text = await readTailText(ACTIVITY_FILE, ACTIVITY_TAIL_BYTES);
+  const entries = text.split('\n').filter(Boolean)
+    .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+    .filter(Boolean).reverse();
   const keyword = String(search || '').trim().toLowerCase();
   const filtered = keyword
     ? entries.filter((item) => `${item.action} ${item.target} ${item.message}`.toLowerCase().includes(keyword))
@@ -309,8 +424,23 @@ function setCors(response, origin) {
   }
 }
 
+// 统一安全响应头：禁止 MIME 嗅探与跨站嵌套，且不通过 Referer 泄露本机地址
+function setSecurityHeaders(response) {
+  response.setHeader('X-Content-Type-Options', 'nosniff');
+  response.setHeader('X-Frame-Options', 'DENY');
+  response.setHeader('Referrer-Policy', 'no-referrer');
+}
+
+// RFC 5987 的 ext-value 只接受 attr-char，而 encodeURIComponent 不会转义 ' ( ) * —— 含这些字符的文件名
+// 会让 Content-Disposition 变成非法值。这里补转义，并把 CR/LF 一并编码以杜绝头部注入。
+function encodeRfc5987(value) {
+  return encodeURIComponent(value.replace(/[\r\n]/g, ' '))
+    .replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
 function send(response, status, body, origin) {
   setCors(response, origin);
+  setSecurityHeaders(response);
   response.setHeader('Content-Type', 'application/json; charset=utf-8');
   response.setHeader('Cache-Control', 'no-store');
   response.statusCode = status;
@@ -332,11 +462,9 @@ function serviceUnitFor(key) {
 // ===== AI 副驾驶：只读建议者。配置存 data/ai.local.json（不进 git），AI 输出一律不直接执行 =====
 const AI_CONFIG_FILE = path.join(DATA_DIR, 'ai.local.json');
 function readAiConfig() {
-  try {
-    const config = JSON.parse(readFileSync(AI_CONFIG_FILE, 'utf8'));
-    if (!config.baseUrl || !config.apiKey || !config.model) return null;
-    return { baseUrl: String(config.baseUrl).replace(/\/$/, ''), apiKey: String(config.apiKey), model: String(config.model) };
-  } catch { return null; }
+  const config = readJsonCached(AI_CONFIG_FILE);
+  if (!config?.baseUrl || !config?.apiKey || !config?.model) return null;
+  return { baseUrl: String(config.baseUrl).replace(/\/$/, ''), apiKey: String(config.apiKey), model: String(config.model) };
 }
 
 async function aiChat(messages) {
@@ -364,12 +492,18 @@ const SAFE_TEXT = (value, max = 8000) => String(value || '').slice(0, max);
 
 const COMPOSE_FILE_NAMES = ['compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml'];
 let composeDirCache = null;
+// 编排目录最终会作为位置参数交给 bash，这里只接受不含空格与引号的绝对路径
+function normalizeComposeDir(value) {
+  const dir = String(value || '').replaceAll('\\', '/').replace(/\/+$/, '');
+  if (!dir.startsWith('/') || /['"\r\n\t ]/.test(dir)) throw new Error('编排目录需为不含空格与引号的绝对路径');
+  return dir;
+}
 async function resolveComposeDir() {
   // 默认放在 WSL 默认用户的 home 下（UNC 共享以该身份访问，必须可写），可用 WPANEL_COMPOSE_DIR 覆盖
-  if (process.env.WPANEL_COMPOSE_DIR) return process.env.WPANEL_COMPOSE_DIR.replaceAll('\\', '/');
+  if (process.env.WPANEL_COMPOSE_DIR) return normalizeComposeDir(process.env.WPANEL_COMPOSE_DIR);
   if (composeDirCache) return composeDirCache;
   const home = await run('wsl.exe', ['-d', DISTRO, '--exec', 'sh', '-c', 'printf %s "$HOME"']);
-  composeDirCache = `${home.ok && home.stdout ? home.stdout.trim() : FILE_ROOTS[0] || '/tmp'}/compose`;
+  composeDirCache = normalizeComposeDir(`${home.ok && home.stdout ? home.stdout.trim() : FILE_ROOTS[0] || '/tmp'}/compose`);
   return composeDirCache;
 }
 
@@ -385,17 +519,15 @@ const STORE_BRANCH_DEFAULT = process.env.WPANEL_STORE_BRANCH || 'main';
 // mirror 为 docker.io 镜像加速站（安装时改写镜像地址），默认 docker.1ms.run，留空则直连
 function readStoreConfig() {
   const fallback = { repo: STORE_REPO_DEFAULT, branch: STORE_BRANCH_DEFAULT, mirror: 'docker.1ms.run' };
-  try {
-    const parsed = JSON.parse(readFileSync(LOCAL_CONFIG_FILE, 'utf8'));
-    const repo = parsed?.store?.repo;
-    const branch = parsed?.store?.branch;
-    const mirror = parsed?.store?.mirror;
-    return {
-      repo: typeof repo === 'string' && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?$/.test(repo) ? repo.replace(/\.git$/, '') : fallback.repo,
-      branch: typeof branch === 'string' && /^[\w.-]{1,64}$/.test(branch) ? branch : fallback.branch,
-      mirror: mirror == null ? fallback.mirror : (typeof mirror === 'string' && /^[a-z0-9][a-z0-9.-]*(:\d+)?$/.test(mirror) ? mirror : ''),
-    };
-  } catch { return fallback; }
+  const parsed = readJsonCached(LOCAL_CONFIG_FILE);
+  const repo = parsed?.store?.repo;
+  const branch = parsed?.store?.branch;
+  const mirror = parsed?.store?.mirror;
+  return {
+    repo: typeof repo === 'string' && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?$/.test(repo) ? repo.replace(/\.git$/, '') : fallback.repo,
+    branch: typeof branch === 'string' && /^[\w.-]{1,64}$/.test(branch) ? branch : fallback.branch,
+    mirror: mirror == null ? fallback.mirror : (typeof mirror === 'string' && /^[a-z0-9][a-z0-9.-]*(:\d+)?$/.test(mirror) ? mirror : ''),
+  };
 }
 
 // 仅改写 docker.io 镜像（显式或隐式）；其他 registry（ghcr/quay/私有）保持原样
@@ -405,7 +537,8 @@ function mirrorImageRef(image, mirror) {
   // 无路径段（如 busybox:latest、nginx）→ docker.io 隐式镜像；有路径段才可能带 registry 主机
   if (slash === -1) return `${mirror}/${name}`;
   const host = name.slice(0, slash);
-  const hasExplicitRegistry = host.includes('.') || host.includes(':');
+  // Docker 把含 . 或 : 的首段视为 registry 主机，localhost 也单独特判 —— 漏掉它会把它误当命名空间改写
+  const hasExplicitRegistry = host.includes('.') || host.includes(':') || host === 'localhost';
   return hasExplicitRegistry ? name : `${mirror}/${name}`;
 }
 
@@ -424,7 +557,15 @@ function applyImageMirror(composeText, mirror) {
 }
 const validAppId = (id) => typeof id === 'string' && /^[a-z0-9][a-z0-9._-]{0,127}$/.test(id);
 
+// 并发调用共享同一次下载：多个标签页同时打开商店时，避免重复下载与互相覆盖缓存目录
+let storeDownload = null;
 async function downloadStore() {
+  if (storeDownload) return storeDownload;
+  storeDownload = fetchStoreArchive().finally(() => { storeDownload = null; });
+  return storeDownload;
+}
+
+async function fetchStoreArchive() {
   const { repo, branch } = readStoreConfig();
   const cacheDir = path.dirname(STORE_DIR);
   await mkdir(cacheDir, { recursive: true });
@@ -432,11 +573,12 @@ async function downloadStore() {
   const codeload = `${repo.replace(/\/$/, '').replace('https://github.com/', 'https://codeload.github.com/')}/tar.gz/refs/heads/${branch}`;
   const response = await fetch(codeload, { redirect: 'follow', signal: AbortSignal.timeout(600_000) });
   if (!response.ok || !response.body) throw new Error(`模板源下载失败（HTTP ${response.status}）`);
-  const tarPath = path.join(cacheDir, 'store.tar.gz');
+  // 每次下载用独立文件名，避免并发或上次残留的 tar 互相踩
+  const tarPath = path.join(cacheDir, `store-${randomUUID()}.tar.gz`);
   await pipeline(response.body, createWriteStream(tarPath));
   // 用相对路径解压：GNU tar 会把 'C:\' 中的冒号当作远程主机名
-  const extractResult = await run('tar', ['-xzf', 'store.tar.gz'], { timeout: 300_000, cwd: cacheDir });
-  await rm(tarPath, { force: true });
+  const extractResult = await run('tar', ['-xzf', path.basename(tarPath)], { timeout: 300_000, cwd: cacheDir });
+  await rm(tarPath, { force: true }).catch(() => {});
   if (!extractResult.ok) throw new Error('模板源解压失败：' + (extractResult.stderr || '').slice(0, 200));
   const extracted = path.join(cacheDir, `${(repo.split('/').pop() || 'appstore').replace(/\.git$/, '')}-${branch}`);
   if (!existsSync(path.join(extracted, 'apps'))) throw new Error('模板源解压后缺少 apps 目录');
@@ -451,20 +593,32 @@ async function ensureStore() {
 
 // 安装后台任务：compose up 拉镜像可能持续数分钟，输出流式存入内存任务供前端轮询
 const installJobs = new Map();
+// 只清理已结束的任务，避免把仍在运行的安装日志丢掉
 function pruneInstallJobs() {
   if (installJobs.size <= 20) return;
-  for (const key of [...installJobs.keys()].slice(0, installJobs.size - 20)) installJobs.delete(key);
+  for (const [key, job] of installJobs) {
+    if (installJobs.size <= 20) break;
+    if (job.status === 'running') continue;
+    installJobs.delete(key);
+  }
 }
 
 function safeStorePath(...segments) {
-  const resolved = path.resolve(STORE_DIR, ...segments);
-  if (!resolved.startsWith(path.resolve(STORE_DIR))) throw new Error('路径无效');
+  const root = path.resolve(STORE_DIR);
+  const resolved = path.resolve(root, ...segments);
+  // 必须等于根本身，或落在「根 + 分隔符」之下。
+  // 只比较裸前缀会漏掉兄弟目录：STORE_DIR=/tmp/store 时 /tmp/store-evil 也能通过。
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) throw new Error('路径无效');
   return resolved;
 }
 
-function storeAppMeta(id) {
+// 商店模板来自第三方：外部链接只放行 http/https。
+// 否则模板里写 javascript: 之类的伪协议会被前端渲染成可点链接，点击即在面板源下执行脚本。
+const httpUrl = (value) => (/^https?:\/\//i.test(String(value || '')) ? String(value) : '');
+
+async function storeAppMeta(id) {
   const file = safeStorePath('apps', id, 'data.yml');
-  const meta = parseYaml(readFileSync(file, 'utf8')) || {};
+  const meta = parseYaml(await readFile(file, 'utf8')) || {};
   const props = meta.additionalProperties || {};
   return {
     id,
@@ -473,22 +627,25 @@ function storeAppMeta(id) {
     description: meta.description || props.shortDescZh || '',
     tags: props.tags || meta.tags || [],
     type: props.type || '',
-    website: props.website || '',
-    github: props.github || '',
-    document: props.document || '',
+    website: httpUrl(props.website),
+    github: httpUrl(props.github),
+    document: httpUrl(props.document),
   };
 }
 
-function storeVersions(id) {
+async function storeVersions(id) {
   const root = safeStorePath('apps', id);
-  return existsSync(root)
-    ? readdirSync(root, { withFileTypes: true }).filter((item) => item.isDirectory() && /^\d+(\.\d+)*$/.test(item.name)).map((item) => item.name)
-      .sort((a, b) => String(a).localeCompare(String(b), 'en', { numeric: true }))
-    : [];
+  try {
+    const dirents = await readdir(root, { withFileTypes: true });
+    return dirents.filter((item) => item.isDirectory() && /^\d+(\.\d+)*$/.test(item.name)).map((item) => item.name)
+      .sort((a, b) => String(a).localeCompare(String(b), 'en', { numeric: true }));
+  } catch {
+    return [];
+  }
 }
 
-function storeFormFields(id, version) {
-  const versionMeta = parseYaml(readFileSync(safeStorePath('apps', id, version, 'data.yml'), 'utf8')) || {};
+async function storeFormFields(id, version) {
+  const versionMeta = parseYaml(await readFile(safeStorePath('apps', id, version, 'data.yml'), 'utf8')) || {};
   return (versionMeta.additionalProperties?.formFields || []).map((field) => ({
     envKey: String(field.envKey || ''),
     label: field.label?.zh || field.labelZh || field.label?.en || field.labelEn || String(field.envKey || ''),
@@ -500,8 +657,8 @@ function storeFormFields(id, version) {
 }
 
 // 安装渲染：表单参数 → .env；镜像按加速站设置改写。预览与安装共用，保证所见即所装
-function renderStoreInstall(id, version, params) {
-  const formFields = storeFormFields(id, version);
+async function renderStoreInstall(id, version, params) {
+  const formFields = await storeFormFields(id, version);
   const input = typeof params === 'object' && params ? params : {};
   const envLines = [`CONTAINER_NAME=${id}`];
   for (const field of formFields) {
@@ -515,7 +672,7 @@ function renderStoreInstall(id, version, params) {
     }
     envLines.push(`${key}=${value}`);
   }
-  const rawCompose = readFileSync(safeStorePath('apps', id, version, 'docker-compose.yml'), 'utf8');
+  const rawCompose = await readFile(safeStorePath('apps', id, version, 'docker-compose.yml'), 'utf8');
   return { compose: applyImageMirror(rawCompose, readStoreConfig().mirror), envText: envLines.join('\n') + '\n', rawCompose };
 }
 
@@ -531,9 +688,14 @@ async function composeProjectUnc(project, mustExist = true) {
   return unc;
 }
 
+// 目录与项目名以位置参数传入，不做字符串拼接，避免命令注入
 async function runCompose(project, args, timeout = 180_000) {
   const dir = await resolveComposeDir();
-  const result = await run('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'bash', '-lc', `cd '${dir}/${project}' && docker compose ${args} 2>&1`], { timeout });
+  const result = await run('wsl.exe', [
+    '-d', DISTRO, '-u', 'root', '--exec', 'bash', '-lc',
+    'cd -- "$1/$2" && shift 2 && docker compose "$@" 2>&1',
+    'wpanel-compose', dir, project, ...args.trim().split(/\s+/).filter(Boolean),
+  ], { timeout });
   if (!result.ok) throw new Error(result.stdout || result.stderr || 'Compose 操作失败');
   return result;
 }
@@ -556,8 +718,8 @@ async function handleAction(pathname, body) {
       const stopped = await docker('stop', '-t', '60', ...runningIds);
       if (!stopped.ok) throw new Error(stopped.stderr || '部分容器未能正常停止');
     }
-    await wsl('systemctl', 'stop', 'postgresql.service');
-    await wsl('systemctl', 'stop', 'dpanel.service', 'docker.service', 'docker.socket', 'containerd.service');
+    // 停止单元来自 data/wpanel.local.json 的 services 配置 + WPANEL_STOP_UNITS，不再写死具体服务
+    await wsl('systemctl', 'stop', ...shutdownStopUnits());
     const result = await run('wsl.exe', ['--terminate', DISTRO], { timeout: 30_000 });
     if (!result.ok) throw new Error(result.stderr || 'Ubuntu 关闭失败');
     return addActivity('shutdown', 'Ubuntu', true, '容器和服务已正常停止，Ubuntu 已关闭');
@@ -571,7 +733,7 @@ async function handleAction(pathname, body) {
 
   if (pathname === '/api/docker/stop') {
     if (body.confirm !== 'STOP_DOCKER') throw new Error('需要停止确认');
-    const result = await wsl('systemctl', 'stop', 'dpanel.service', 'docker.service', 'docker.socket', 'containerd.service');
+    const result = await wsl('systemctl', 'stop', ...dockerStopUnits());
     if (!result.ok) throw new Error(result.stderr || 'Docker 停止失败');
     return addActivity('stop', 'Docker', true, 'Docker 服务已停止');
   }
@@ -627,7 +789,7 @@ async function handleAction(pathname, body) {
     const job = { status: 'running', output: `docker pull ${target}\n` };
     installJobs.set(jobId, job);
     pruneInstallJobs();
-    const child = spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'docker', 'pull', target], { windowsHide: true });
+    const child = trackChild(spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'docker', 'pull', target], { windowsHide: true }));
     const append = (chunk) => {
       job.output += chunk.toString('utf8');
       if (job.output.length > 120000) job.output = job.output.slice(-90000);
@@ -706,15 +868,14 @@ async function handleAction(pathname, body) {
     const id = typeof body.id === 'string' ? body.id : '';
     if (!validAppId(id)) throw new Error('应用 ID 无效');
     await ensureStore();
-    const versions = storeVersions(id);
+    const versions = await storeVersions(id);
     if (!versions.length) throw new Error('该应用没有可用版本');
     const version = versions[versions.length - 1];
     const composeUnc = await composeProjectUnc(id, action === 'uninstall'); // 安装时要求不存在，卸载时要求存在
 
     if (action === 'install') {
       if (existsSync(composeUnc)) throw new Error('编排目录中已存在同名项目，请先卸载或改名');
-      const rendered = renderStoreInstall(id, version, body.params);
-      const upArgs = 'up -d';
+      const rendered = await renderStoreInstall(id, version, body.params);
       await mkdir(composeUnc, { recursive: true });
       await writeFile(`${composeUnc}\\docker-compose.yml`, rendered.compose, 'utf8');
       await writeFile(`${composeUnc}\\.env`, rendered.envText, 'utf8');
@@ -728,7 +889,11 @@ async function handleAction(pathname, body) {
       installJobs.set(jobId, job);
       pruneInstallJobs();
       const dir = await resolveComposeDir();
-      const child = spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'bash', '-lc', `cd '${dir}/${id}' && docker compose ${upArgs} 2>&1`], { windowsHide: true });
+      const child = trackChild(spawn('wsl.exe', [
+        '-d', DISTRO, '-u', 'root', '--exec', 'bash', '-lc',
+        'cd -- "$1/$2" && docker compose up -d 2>&1',
+        'wpanel-store', dir, id,
+      ], { windowsHide: true }));
       const append = (chunk) => {
         job.output += chunk.toString('utf8');
         if (job.output.length > 120000) job.output = job.output.slice(-90000);
@@ -755,10 +920,23 @@ async function handleAction(pathname, body) {
 
 const server = http.createServer(async (request, response) => {
   const origin = request.headers.origin;
-  const url = new URL(request.url || '/', `http://${request.headers.host || `${HOST}:${PORT}`}`);
+
+  // Host 校验必须排在 URL 解析之前：解析 URL 要用 Host 头作为 base，
+  // 先解析等于信任了尚未校验的输入；而且非法 Host 会让 new URL 抛错，
+  // 此时还没进入下面的 try，响应将永远不返回（客户端只能等超时）。
+  // 同时挡住「恶意域名解析到 127.0.0.1」的 DNS rebinding 读取。
+  if (!allowedHosts.has(request.headers.host || '')) return send(response, 403, { error: 'Host 不受信任' }, origin);
+
+  let url;
+  try {
+    url = new URL(request.url || '/', `http://${request.headers.host}`);
+  } catch {
+    return send(response, 400, { error: '请求地址无效' }, origin);
+  }
 
   if (request.method === 'OPTIONS') {
     if (!origin || !allowedOrigins.has(origin)) return send(response, 403, { error: '来源不受信任' }, origin);
+    setSecurityHeaders(response);
     response.setHeader('Access-Control-Allow-Origin', origin);
     response.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-WPanel-Token');
     response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -848,12 +1026,13 @@ const server = http.createServer(async (request, response) => {
       if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
       const body = await readBody(request);
       const baseUrl = SAFE_TEXT(body.baseUrl, 300).replace(/\/$/, '');
-      const apiKey = SAFE_TEXT(body.apiKey, 300);
+      const submitted = SAFE_TEXT(body.apiKey, 300);
       const model = SAFE_TEXT(body.model, 120);
+      // 前端留空时回填 __KEEP__：沿用已保存的密钥，避免二次保存把真实密钥覆盖成占位符
+      const apiKey = submitted === '__KEEP__' ? (readAiConfig()?.apiKey || '') : submitted;
       if (!/^https?:\/\//.test(baseUrl)) throw new Error('接口地址需以 http(s):// 开头');
-      if (!baseUrl || !apiKey || !model) throw new Error('三项配置均必填');
-      await mkdir(DATA_DIR, { recursive: true });
-      await writeFile(AI_CONFIG_FILE, JSON.stringify({ baseUrl, apiKey, model }, null, 2), 'utf8');
+      if (!baseUrl || !apiKey || !model) throw new Error('三项配置均必填（密钥留空时需先成功保存过一次）');
+      await writeJsonConfig(AI_CONFIG_FILE, { baseUrl, apiKey, model });
       return addActivity('save', 'AI 设置', true, `已保存（${model}）`);
     }
 
@@ -952,14 +1131,26 @@ const server = http.createServer(async (request, response) => {
         } catch { /* 跳过无法解析的行 */ }
       }
       setCors(response, origin);
+      setSecurityHeaders(response);
       response.setHeader('Content-Type', 'application/x-tar');
       response.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}.tar`);
       response.setHeader('Cache-Control', 'no-store');
       response.flushHeaders();
-      const child = spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'docker', 'save', reference], { windowsHide: true });
+      const child = trackChild(spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'docker', 'save', reference], { windowsHide: true }));
+      // docker save 正常时 stderr 是安静的，但告警也走 stderr；
+      // 只有「一个字节都没发出去就失败」才中断响应，避免把正常的 tar 截断成半截文件
+      let sent = false;
+      let stderrTail = '';
+      child.stdout.on('data', () => { sent = true; });
       child.stdout.pipe(response);
-      child.stderr.on('data', () => { try { response.destroy(); } catch { /* 已断开 */ } });
+      child.stderr.on('data', (chunk) => { stderrTail = (stderrTail + chunk.toString('utf8')).slice(-400); });
       child.on('error', () => { try { response.destroy(); } catch { /* 已断开 */ } });
+      child.on('close', (code) => {
+        if (code !== 0 && !sent) {
+          console.error(`镜像导出失败（${reference}）：${stderrTail.trim() || `退出码 ${code}`}`);
+          try { response.destroy(); } catch { /* 已断开 */ }
+        }
+      });
       request.on('close', () => child.kill());
       return;
     }
@@ -967,7 +1158,9 @@ const server = http.createServer(async (request, response) => {
     // 镜像导入：请求体为 docker save 的 tar 流，上限 2GB
     if (request.method === 'POST' && url.pathname === '/api/images/import') {
       if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
-      const tmpPath = path.join(DATA_DIR, 'import.tar');
+      // 临时文件带随机后缀，避免并发导入互相覆盖；data/ 可能尚未创建
+      await mkdir(DATA_DIR, { recursive: true });
+      const tmpPath = path.join(DATA_DIR, `import-${randomUUID()}.tar`);
       let total = 0;
       const limit = new Transform({
         transform(chunk, encoding, callback) {
@@ -978,7 +1171,7 @@ const server = http.createServer(async (request, response) => {
       });
       try {
         await pipeline(request, limit, createWriteStream(tmpPath));
-        const child = spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'docker', 'load'], { windowsHide: true });
+        const child = trackChild(spawn('wsl.exe', ['-d', DISTRO, '-u', 'root', '--exec', 'docker', 'load'], { windowsHide: true }));
         const loadResult = await Promise.all([
           pipeline(createReadStream(tmpPath), child.stdin).then(() => 'loaded'),
           new Promise((resolve) => {
@@ -1012,11 +1205,10 @@ const server = http.createServer(async (request, response) => {
       if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
       await ensureStore();
       const appsRoot = safeStorePath('apps');
-      const apps = readdirSync(appsRoot, { withFileTypes: true })
-        .filter((item) => item.isDirectory() && existsSync(path.join(appsRoot, item.name, 'data.yml')))
-        .map((item) => { try { return storeAppMeta(item.name); } catch { return null; } })
-        .filter(Boolean)
-        .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+      const dirents = await readdir(appsRoot, { withFileTypes: true });
+      const apps = (await Promise.all(dirents.filter((item) => item.isDirectory()).map(async (item) => {
+        try { return await storeAppMeta(item.name); } catch { return null; }
+      }))).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
       const storeConfig = readStoreConfig();
       return send(response, 200, { source: `${storeConfig.repo}@${storeConfig.branch}`, mirror: storeConfig.mirror, apps }, origin);
     }
@@ -1031,11 +1223,9 @@ const server = http.createServer(async (request, response) => {
       if (!/^[\w.-]{1,64}$/.test(branch)) throw new Error('分支名无效');
       if (mirror && !/^[a-z0-9][a-z0-9.-]*(:\d+)?$/.test(mirror)) throw new Error('加速站地址无效（形如 docker.1ms.run）');
       const previous = readStoreConfig();
-      await mkdir(DATA_DIR, { recursive: true });
-      let local = {};
-      try { local = JSON.parse(readFileSync(LOCAL_CONFIG_FILE, 'utf8')); } catch { local = {}; }
+      const local = readJsonCached(LOCAL_CONFIG_FILE) || {};
       local.store = { repo, branch, mirror };
-      await writeFile(LOCAL_CONFIG_FILE, JSON.stringify(local, null, 2), 'utf8');
+      await writeJsonConfig(LOCAL_CONFIG_FILE, local);
       // 仅当仓库/分支变化时才清缓存重新下载；加速站变化即时生效
       if (repo !== previous.repo || branch !== previous.branch) await rm(STORE_DIR, { recursive: true, force: true });
       return addActivity('save', '商店模板源', true, `${repo}@${branch}${mirror ? ` · 加速站 ${mirror}` : ' · 直连'}`);
@@ -1054,12 +1244,13 @@ const server = http.createServer(async (request, response) => {
       const id = decodeURIComponent(url.pathname.slice('/api/store/logo/'.length));
       if (!validAppId(id)) return send(response, 400, { error: '应用 ID 无效' }, origin);
       setCors(response, origin);
-      const logo = safeStorePath('apps', id, 'logo.png');
-      if (!existsSync(logo)) { response.statusCode = 404; return response.end(); }
+      setSecurityHeaders(response);
+      const logo = await readFile(safeStorePath('apps', id, 'logo.png')).catch(() => null);
+      if (!logo) { response.statusCode = 404; return response.end(); }
       response.setHeader('Content-Type', 'image/png');
       response.setHeader('Cache-Control', 'max-age=86400');
       response.statusCode = 200;
-      response.end(readFileSync(logo));
+      response.end(logo);
       return;
     }
 
@@ -1068,11 +1259,11 @@ const server = http.createServer(async (request, response) => {
       const id = decodeURIComponent(url.pathname.slice('/api/store/app/'.length));
       if (!validAppId(id)) throw new Error('应用 ID 无效');
       await ensureStore();
-      const versions = storeVersions(id);
+      const versions = await storeVersions(id);
       if (!versions.length) throw new Error('该应用没有可用版本');
       const version = versions[versions.length - 1];
-      const meta = storeAppMeta(id);
-      return send(response, 200, { ...meta, version, formFields: storeFormFields(id, version), mirror: readStoreConfig().mirror }, origin);
+      const meta = await storeAppMeta(id);
+      return send(response, 200, { ...meta, version, formFields: await storeFormFields(id, version), mirror: readStoreConfig().mirror }, origin);
     }
 
     // 安装预览：与真实安装共用同一渲染逻辑（参数校验 + .env + 镜像加速改写）
@@ -1082,10 +1273,10 @@ const server = http.createServer(async (request, response) => {
       const id = typeof body.id === 'string' ? body.id : '';
       if (!validAppId(id)) throw new Error('应用 ID 无效');
       await ensureStore();
-      const versions = storeVersions(id);
+      const versions = await storeVersions(id);
       if (!versions.length) throw new Error('该应用没有可用版本');
       const version = versions[versions.length - 1];
-      const rendered = renderStoreInstall(id, version, body.params);
+      const rendered = await renderStoreInstall(id, version, body.params);
       return send(response, 200, { compose: rendered.compose, env: rendered.envText, mirror: readStoreConfig().mirror }, origin);
     }
 
@@ -1105,10 +1296,11 @@ const server = http.createServer(async (request, response) => {
       const tail = ['100', '250', '1000'].includes(tailParam || '') ? tailParam : '250';
       await requireContainer(name);
       setCors(response, origin);
+      setSecurityHeaders(response);
       response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       response.setHeader('Cache-Control', 'no-store');
       response.flushHeaders();
-      const child = spawn('wsl.exe', ['-d', DISTRO, '--exec', 'docker', 'logs', '-f', '--tail', tail, name], { windowsHide: true });
+      const child = trackChild(spawn('wsl.exe', ['-d', DISTRO, '--exec', 'docker', 'logs', '-f', '--tail', tail, name], { windowsHide: true }));
       const push = (payload) => { try { response.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* 连接已断开 */ } };
       let pending = '';
       const onChunk = (chunk) => {
@@ -1130,7 +1322,7 @@ const server = http.createServer(async (request, response) => {
       if (request.headers['x-wpanel-token'] !== TOKEN) return send(response, 403, { error: '会话无效' }, origin);
       const path = normalizeLinuxPath(url.searchParams.get('path') || '');
       if (!path) throw new Error('路径无效');
-      return send(response, 200, { path, roots: FILE_ROOTS, entries: await listDir(path) }, origin);
+      return send(response, 200, { path, roots: FILE_ROOTS, ...(await listDir(path)) }, origin);
     }
 
     if (request.method === 'GET' && url.pathname === '/api/files/read') {
@@ -1149,9 +1341,10 @@ const server = http.createServer(async (request, response) => {
       const info = await stat(unc);
       if (info.isDirectory()) throw new Error('目录不支持下载，请进入后操作具体文件');
       setCors(response, origin);
+      setSecurityHeaders(response);
       response.setHeader('Content-Type', 'application/octet-stream');
       response.setHeader('Content-Length', info.size);
-      response.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(path.split('/').pop() || 'file')}`);
+      response.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeRfc5987(path.split('/').pop() || 'file')}`);
       response.setHeader('Cache-Control', 'no-store');
       response.statusCode = 200;
       const stream = createReadStream(unc);
@@ -1178,7 +1371,8 @@ const server = http.createServer(async (request, response) => {
       const dirStat = await stat(await checkedUnc(dir));
       if (!dirStat.isDirectory()) throw new Error('目标不是目录');
       const target = dir === '/' ? `/${name}` : `${dir}/${name}`;
-      const unc = await checkedUnc(target, false);
+      // follow=true：同名目标若是指向允许根之外的符号链接，直接拒绝写入
+      const unc = await checkedUnc(target);
       if (url.searchParams.get('overwrite') !== '1') {
         try { await access(unc); throw new Error('同名文件已存在'); } catch (error) { if (error.message === '同名文件已存在') throw error; }
       }
@@ -1270,3 +1464,23 @@ const server = http.createServer(async (request, response) => {
 server.listen(PORT, HOST, () => {
   console.log(`WPanel controller listening on http://${HOST}:${PORT}`);
 });
+
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    console.error(`端口 ${PORT} 已被占用：请先运行「停止WPanel.bat」，或设置 WPANEL_PORT 换一个端口。`);
+  } else {
+    console.error(`控制服务启动失败：${error.message}`);
+  }
+  process.exit(1);
+});
+
+// 退出时回收子进程（日志跟随、镜像拉取/导出、商店安装任务）
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    for (const child of children) {
+      try { child.kill(); } catch { /* 已退出 */ }
+    }
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  });
+}
