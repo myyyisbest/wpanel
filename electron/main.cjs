@@ -35,7 +35,7 @@ function startServices() {
 
 function stopServices() {
   for (const child of [ui, controller]) {
-    try { child && child.kill(); } catch { /* 已退出 */ }
+    if (child) { try { child.kill(); } catch { /* 已退出 */ } }
   }
   ui = null;
   controller = null;
