@@ -156,7 +156,7 @@ export default function Dashboard() {
     let active=true;
     fetch(`${API}/api/session`,{cache:'no-store'}).then(r=>r.json()).then(data=>{if(active)setToken((data as {token?:string}).token||'')}).catch(()=>{if(active)setError('无法连接 Windows 控制服务，请运行“启动WPanel.bat”。')});
     // 初次进入页面立即拉取一次状态与历史；此后每 5 秒轮询（标签页隐藏时暂停）
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- 初次拉取属于外部系统订阅的启动读取
+     
     refresh();
      
     loadActivity();
