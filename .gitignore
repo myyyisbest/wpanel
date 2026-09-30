@@ -20,3 +20,6 @@ next-env.d.ts
 # tooling local files
 .zcode/
 tsconfig.tsbuildinfo
+
+# security hook local state
+.mimosa/
