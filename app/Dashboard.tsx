@@ -103,14 +103,15 @@ export default function Dashboard() {
       }));
       setStatus(next); setError('');
     } catch {
-      // 控制服务失联时，让本页所属的 UI 服务把它拉起来（每次打开页面只自动尝试一次）
+      // 控制服务失联时，让本页所属的 UI 服务把它拉起来（每次打开页面只自动尝试一次）；
+      // 成败由既有的 5 秒轮询复检，成功后错误自动清除
       if (!bootAttempted) {
         bootAttempted = true;
-        try { await fetch('/api/boot',{cache:'no-store'}); } catch { /* 拉起失败则维持原提示 */ }
-        setTimeout(() => { void refresh(); }, 1500);
-        return;
+        try { await fetch('/api/boot',{cache:'no-store'}); } catch { /* 拉起失败则维持提示 */ }
+        setError('正在尝试自动启动控制服务…');
+      } else {
+        setError('无法连接 Windows 控制服务，请运行“启动WPanel.bat”。');
       }
-      setError('无法连接 Windows 控制服务，请运行“启动WPanel.bat”。');
     }
   },[]);
 
@@ -155,11 +156,8 @@ export default function Dashboard() {
   useEffect(() => {
     let active=true;
     fetch(`${API}/api/session`,{cache:'no-store'}).then(r=>r.json()).then(data=>{if(active)setToken((data as {token?:string}).token||'')}).catch(()=>{if(active)setError('无法连接 Windows 控制服务，请运行“启动WPanel.bat”。')});
-    // 初次进入页面立即拉取一次状态与历史；此后每 5 秒轮询（标签页隐藏时暂停）
-     
-    refresh();
-     
-    loadActivity();
+    // 初次进入页面立即拉取一次状态与历史（微任务中执行）；此后每 5 秒轮询（标签页隐藏时暂停）
+    void Promise.resolve().then(async () => { await refresh(); await loadActivity(); });
     const timer=window.setInterval(()=>{ if(document.visibilityState!=='hidden') refresh(); },5000);
     const onVisible=()=>{ if(document.visibilityState==='visible'){ refresh(); loadActivity(); } };
     document.addEventListener('visibilitychange',onVisible);
