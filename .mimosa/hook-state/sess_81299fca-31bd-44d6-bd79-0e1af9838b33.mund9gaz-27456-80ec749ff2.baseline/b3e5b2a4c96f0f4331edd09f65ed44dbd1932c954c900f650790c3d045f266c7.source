@@ -66,8 +66,6 @@ function Spark({ values, tone }:{ values:(number|null)[]; tone:string }) {
   </svg>;
 }
 
-let bootAttempted = false;
-
 export default function Dashboard() {
   const [status,setStatus] = useState<Status|null>(null);
   const [activity,setActivity] = useState<ActivityEntry[]>([]);
@@ -102,16 +100,7 @@ export default function Dashboard() {
         mem: [...previous.mem, memPercent].slice(-60),
       }));
       setStatus(next); setError('');
-    } catch {
-      // 控制服务失联时，让本页所属的 UI 服务把它拉起来（每次打开页面只自动尝试一次）
-      if (!bootAttempted) {
-        bootAttempted = true;
-        try { await fetch('/api/boot',{cache:'no-store'}); } catch { /* 拉起失败则维持原提示 */ }
-        setTimeout(() => { void refresh(); }, 1500);
-        return;
-      }
-      setError('无法连接 Windows 控制服务，请运行“启动WPanel.bat”。');
-    }
+    } catch { setError('无法连接 Windows 控制服务，请运行“启动WPanel.bat”。'); }
   },[]);
 
   const loadActivity = useCallback(async () => {
